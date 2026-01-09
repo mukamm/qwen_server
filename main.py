@@ -9,9 +9,7 @@ import requests
 import logging
 from datetime import datetime
 
-####################
-# LOGGING
-####################
+##################### LOGGING ####################
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,9 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-####################
-# CONFIGURATION
-####################
+##################### CONFIGURATION ####################
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
@@ -40,9 +36,7 @@ SESSION_TTL = 86400 * 7  # 7 days
 MAX_HISTORY_LENGTH = 20
 SUMMARY_THRESHOLD = 10
 
-####################
-# REDIS CONNECTION
-####################
+##################### REDIS CONNECTION ####################
 
 r = redis.Redis(
     host=REDIS_HOST,
@@ -54,9 +48,7 @@ r = redis.Redis(
     socket_keepalive=True
 )
 
-####################
-# PYDANTIC MODELS
-####################
+##################### PYDANTIC MODELS ####################
 
 class Message(BaseModel):
     role: str
@@ -79,9 +71,7 @@ class SummaryUpdate(BaseModel):
 class SessionCreate(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
-####################
-# UTILITIES
-####################
+##################### UTILITIES ####################
 
 def generate_id() -> str:
     return str(uuid.uuid4())
@@ -92,9 +82,7 @@ def serialize_messages(messages: List[Message]) -> str:
 def deserialize_messages(data: str) -> List[Message]:
     return [Message(**m) for m in json.loads(data)]
 
-####################
-# SESSION FUNCTIONS
-####################
+##################### SESSION FUNCTIONS ####################
 
 def create_session(metadata: Optional[Dict] = None) -> str:
     session_id = generate_id()
@@ -158,9 +146,7 @@ def list_sessions(limit: int = 100) -> List[str]:
     session_ids = [k.replace(SESSION_PREFIX, "") for k in keys]
     return session_ids[:limit]
 
-####################
-# SUMMARY FUNCTIONS
-####################
+##################### SUMMARY FUNCTIONS ####################
 
 def get_summary(session_id: str) -> str:
     key = f"{SUMMARY_PREFIX}{session_id}"
@@ -176,9 +162,7 @@ def delete_summary(session_id: str) -> bool:
     key = f"{SUMMARY_PREFIX}{session_id}"
     return r.delete(key) > 0
 
-####################
-# LLM CLIENT
-####################
+##################### LLM CLIENT ####################
 
 BASE_URL = f"http://{QWEN_HOST}:{QWEN_PORT}/v1/chat/completions"
 
@@ -243,9 +227,7 @@ Keep the summary under 200 words and focus only on important information."""
         logger.error(f"Summary generation failed: {e}")
         return old_summary
 
-####################
-# CHAT PROCESSING
-####################
+##################### CHAT PROCESSING ####################
 
 def build_context(summary: str, messages: List[Dict]) -> str:
     """Build conversation context from summary and history"""
@@ -324,9 +306,7 @@ def process_chat_message(session_id: str, user_message: str) -> ChatResponse:
         summary=new_summary
     )
 
-####################
-# FASTAPI APP
-####################
+##################### FASTAPI APP ####################
 
 app = FastAPI(
     title="AI Chat Server",
@@ -348,9 +328,7 @@ chat_router = APIRouter(prefix="/chat", tags=["chat"])
 session_router = APIRouter(prefix="/session", tags=["session"])
 summary_router = APIRouter(prefix="/summary", tags=["summary"])
 
-####################
-# HEALTH CHECK
-####################
+##################### HEALTH CHECK ####################
 
 @app.get("/health")
 def health_check():
@@ -374,9 +352,7 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat()
     }
 
-####################
-# CHAT ENDPOINTS
-####################
+##################### CHAT ENDPOINTS ####################
 
 @chat_router.post("/", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -389,9 +365,7 @@ def chat(req: ChatRequest):
         logger.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-####################
-# SESSION ENDPOINTS
-####################
+##################### SESSION ENDPOINTS ####################
 
 @session_router.post("/create")
 def create_new_session(req: SessionCreate = SessionCreate()):
@@ -423,9 +397,7 @@ def get_all_sessions(limit: int = 100):
     sessions = list_sessions(limit)
     return {"sessions": sessions, "count": len(sessions)}
 
-####################
-# SUMMARY ENDPOINTS
-####################
+##################### SUMMARY ENDPOINTS ####################
 
 @summary_router.get("/{session_id}")
 def read_summary(session_id: str):
@@ -478,17 +450,13 @@ def regenerate_summary(session_id: str):
         "updated_at": datetime.utcnow().isoformat()
     }
 
-####################
-# INCLUDE ROUTERS
-####################
+##################### INCLUDE ROUTERS ####################
 
 app.include_router(chat_router)
 app.include_router(session_router)
 app.include_router(summary_router)
 
-####################
-# STARTUP/SHUTDOWN
-####################
+##################### STARTUP/SHUTDOWN ####################
 
 @app.on_event("startup")
 async def startup_event():
