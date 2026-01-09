@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from app.memory.session_store import get_session
+from app.services.chat_service import process_message
 
 router = APIRouter()
 
@@ -10,8 +10,8 @@ class ChatRequest(BaseModel):
 
 @router.post("/chat")
 def chat(req: ChatRequest):
-    session = get_session(req.session_id)
-    if not session:
+    try:
+        response = process_message(req.session_id, req.message)
+        return {"response": response}
+    except KeyError:
         raise HTTPException(status_code=404, detail="Session not found")
-    # Пока просто эхо
-    return {"response": f"Echo: {req.message}"}
