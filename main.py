@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -7,7 +7,10 @@ import uuid
 import json
 import requests
 import logging
+import asyncio
 from datetime import datetime
+from collections import defaultdict
+import time
 
 ##################### LOGGING ####################
 
@@ -27,14 +30,22 @@ REDIS_DB = 0
 QWEN_HOST = "localhost"
 QWEN_PORT = 8001
 QWEN_MODEL = "qwen-7b-instruct"
-QWEN_TIMEOUT = 30
+QWEN_TIMEOUT = 60
 
 SESSION_PREFIX = "session:"
 SUMMARY_PREFIX = "summary:"
 SESSION_TTL = 86400 * 7  # 7 days
 
-MAX_HISTORY_LENGTH = 20
-SUMMARY_THRESHOLD = 10
+# 🔥 КРИТИЧЕСКИЕ ОГРАНИЧЕНИЯ ДЛЯ СТАБИЛЬНОСТИ
+MAX_HISTORY_LENGTH = 6  # Только последние 6 сообщений
+MAX_RESPONSE_TOKENS = 300  # Короткие ответы = быстрее
+MAX_SUMMARY_TOKENS = 200  # Компактные summaries
+SUMMARY_THRESHOLD = 8  # Обновлять summary после 8 сообщений
+
+# 🔒 ЗАЩИТА ОТ ПЕРЕГРУЗКИ
+LLM_CONCURRENCY = 2  # Максимум 2 одновременных запроса к LLM
+RATE_LIMIT_REQUESTS = 1  # 1 запрос
+RATE_LIMIT_WINDOW = 3  # за 3 секунды на session
 
 ##################### REDIS CONNECTION ####################
 
@@ -47,6 +58,32 @@ r = redis.Redis(
     socket_connect_timeout=5,
     socket_keepalive=True
 )
+
+##################### CONCURRENCY CONTROL ####################
+
+# Семафор для ограничения одновременных запросов к LLM
+llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
+
+# Rate limiting по session_id
+rate_limit_tracker: Dict[str, List[float]] = defaultdict(list)
+
+def check_rate_limit(session_id: str) -> bool:
+    """Проверка rate limit для session"""
+    now = time.time()
+    
+    # Удаляем старые запросы
+    rate_limit_tracker[session_id] = [
+        req_time for req_time in rate_limit_tracker[session_id]
+        if now - req_time < RATE_LIMIT_WINDOW
+    ]
+    
+    # Проверяем лимит
+    if len(rate_limit_tracker[session_id]) >= RATE_LIMIT_REQUESTS:
+        return False
+    
+    # Добавляем текущий запрос
+    rate_limit_tracker[session_id].append(now)
+    return True
 
 ##################### PYDANTIC MODELS ####################
 
@@ -64,6 +101,7 @@ class ChatResponse(BaseModel):
     response: str
     timestamp: str
     summary: Optional[str] = None
+    tokens_used: Optional[int] = None
 
 class SummaryUpdate(BaseModel):
     new_summary: str
@@ -76,12 +114,6 @@ class SessionCreate(BaseModel):
 def generate_id() -> str:
     return str(uuid.uuid4())
 
-def serialize_messages(messages: List[Message]) -> str:
-    return json.dumps([{"role": m.role, "content": m.content, "timestamp": m.timestamp} for m in messages])
-
-def deserialize_messages(data: str) -> List[Message]:
-    return [Message(**m) for m in json.loads(data)]
-
 ##################### SESSION FUNCTIONS ####################
 
 def create_session(metadata: Optional[Dict] = None) -> str:
@@ -92,11 +124,12 @@ def create_session(metadata: Optional[Dict] = None) -> str:
         "messages": json.dumps([]),
         "created_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat(),
-        "metadata": json.dumps(metadata or {})
+        "metadata": json.dumps(metadata or {}),
+        "message_count": "0"
     })
     r.expire(key, SESSION_TTL)
     
-    logger.info(f"Session created: {session_id}")
+    logger.info(f"✓ Session created: {session_id}")
     return session_id
 
 def get_session(session_id: str) -> Optional[Dict]:
@@ -111,7 +144,8 @@ def get_session(session_id: str) -> Optional[Dict]:
         "messages": json.loads(data.get("messages", "[]")),
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", ""),
-        "metadata": json.loads(data.get("metadata", "{}"))
+        "metadata": json.loads(data.get("metadata", "{}")),
+        "message_count": int(data.get("message_count", 0))
     }
 
 def update_session(session_id: str, messages: List[Dict]) -> bool:
@@ -120,13 +154,14 @@ def update_session(session_id: str, messages: List[Dict]) -> bool:
     if not r.exists(key):
         return False
     
-    # Keep only recent messages
+    # Храним только последние MAX_HISTORY_LENGTH сообщений
     if len(messages) > MAX_HISTORY_LENGTH:
         messages = messages[-MAX_HISTORY_LENGTH:]
     
     r.hset(key, mapping={
         "messages": json.dumps(messages),
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.utcnow().isoformat(),
+        "message_count": str(len(messages))
     })
     r.expire(key, SESSION_TTL)
     
@@ -137,7 +172,12 @@ def delete_session(session_id: str) -> bool:
     summary_key = f"{SUMMARY_PREFIX}{session_id}"
     
     deleted = r.delete(key, summary_key)
-    logger.info(f"Session deleted: {session_id}")
+    
+    # Очистка rate limit
+    if session_id in rate_limit_tracker:
+        del rate_limit_tracker[session_id]
+    
+    logger.info(f"✓ Session deleted: {session_id}")
     return deleted > 0
 
 def list_sessions(limit: int = 100) -> List[str]:
@@ -156,7 +196,7 @@ def get_summary(session_id: str) -> str:
 def update_summary(session_id: str, summary: str) -> None:
     key = f"{SUMMARY_PREFIX}{session_id}"
     r.set(key, summary, ex=SESSION_TTL)
-    logger.info(f"Summary updated for session: {session_id}")
+    logger.info(f"✓ Summary updated: {session_id}")
 
 def delete_summary(session_id: str) -> bool:
     key = f"{SUMMARY_PREFIX}{session_id}"
@@ -166,90 +206,110 @@ def delete_summary(session_id: str) -> bool:
 
 BASE_URL = f"http://{QWEN_HOST}:{QWEN_PORT}/v1/chat/completions"
 
-def send_to_llm(messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 2000) -> str:
-    try:
-        payload = {
-            "messages": messages,
-            "model": QWEN_MODEL,
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
-        
-        response = requests.post(BASE_URL, json=payload, timeout=QWEN_TIMEOUT)
-        response.raise_for_status()
-        
-        result = response.json()
-        content = result["choices"][0]["message"]["content"]
-        
-        logger.info(f"LLM response received, length: {len(content)}")
-        return content
-        
-    except requests.exceptions.Timeout:
-        logger.error("LLM request timeout")
-        raise HTTPException(status_code=504, detail="LLM service timeout")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"LLM request error: {e}")
-        raise HTTPException(status_code=502, detail=f"LLM service error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error in LLM call: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
-
-def generate_summary(old_summary: str, new_messages: List[Dict]) -> str:
-    """Generate or update conversation summary"""
+async def send_to_llm(messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = MAX_RESPONSE_TOKENS) -> Dict[str, Any]:
+    """Асинхронная отправка запроса к LLM с ограничением concurrency"""
     
+    async with llm_semaphore:
+        logger.info(f"🔄 LLM request started (semaphore: {llm_semaphore._value}/{LLM_CONCURRENCY})")
+        
+        try:
+            payload = {
+                "messages": messages,
+                "model": QWEN_MODEL,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: requests.post(BASE_URL, json=payload, timeout=QWEN_TIMEOUT)
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            
+            # Подсчёт токенов (примерно)
+            tokens_used = result.get("usage", {}).get("total_tokens", len(content.split()))
+            
+            logger.info(f"✓ LLM response: {len(content)} chars, ~{tokens_used} tokens")
+            
+            return {
+                "content": content,
+                "tokens_used": tokens_used
+            }
+            
+        except requests.exceptions.Timeout:
+            logger.error("✗ LLM timeout")
+            raise HTTPException(status_code=504, detail="LLM timeout")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"✗ LLM error: {e}")
+            raise HTTPException(status_code=502, detail=f"LLM error: {str(e)}")
+        except Exception as e:
+            logger.error(f"✗ Unexpected error: {e}")
+            raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
+async def generate_summary(old_summary: str, messages: List[Dict]) -> str:
+    """Генерация краткого summary"""
+    
+    # Берём только последние 4 сообщения для summary
     recent_messages = "\n".join([
-        f"{m['role'].capitalize()}: {m['content']}" 
-        for m in new_messages[-5:]
+        f"{m['role'].capitalize()}: {m['content'][:100]}"
+        for m in messages[-4:]
     ])
     
-    prompt = f"""You are an AI that creates concise conversation summaries for memory purposes.
+    prompt = f"""Create a brief summary (max 150 words) of this conversation.
 
-Old summary:
-{old_summary if old_summary else "No previous summary"}
+Previous summary: {old_summary if old_summary else "None"}
 
 Recent messages:
 {recent_messages}
 
-Create a brief, factual summary that captures:
-- Key topics discussed
-- Important names, dates, or facts mentioned
-- User's preferences or requirements
-- Action items or decisions
+Focus on: key topics, important facts, user preferences.
+Be concise and factual."""
 
-Keep the summary under 200 words and focus only on important information."""
-
-    messages = [{"role": "user", "content": prompt}]
+    llm_messages = [{"role": "user", "content": prompt}]
     
     try:
-        new_summary = send_to_llm(messages, temperature=0.3, max_tokens=500)
-        return new_summary.strip()
+        result = await send_to_llm(llm_messages, temperature=0.3, max_tokens=MAX_SUMMARY_TOKENS)
+        return result["content"].strip()
     except Exception as e:
-        logger.error(f"Summary generation failed: {e}")
+        logger.error(f"✗ Summary generation failed: {e}")
         return old_summary
 
 ##################### CHAT PROCESSING ####################
 
-def build_context(summary: str, messages: List[Dict]) -> str:
-    """Build conversation context from summary and history"""
+def build_compact_context(summary: str, messages: List[Dict]) -> str:
+    """Компактный контекст: summary + последние 4 сообщения"""
     
     context_parts = []
     
     if summary:
-        context_parts.append(f"Conversation Summary:\n{summary}\n")
+        context_parts.append(f"Previous context: {summary[:300]}")
     
     if messages:
+        # Только последние 4 сообщения
+        recent = messages[-4:] if len(messages) > 4 else messages
         history = "\n".join([
-            f"{m['role'].capitalize()}: {m['content']}" 
-            for m in messages[-10:]
+            f"{m['role']}: {m['content'][:200]}"
+            for m in recent
         ])
-        context_parts.append(f"Recent History:\n{history}")
+        context_parts.append(f"Recent:\n{history}")
     
-    return "\n".join(context_parts)
+    return "\n\n".join(context_parts)
 
-def process_chat_message(session_id: str, user_message: str) -> ChatResponse:
-    """Process incoming chat message and generate response"""
+async def process_chat_message(session_id: str, user_message: str) -> ChatResponse:
+    """Обработка сообщения с защитой от перегрузки"""
     
-    # Get session
+    # Rate limit проверка
+    if not check_rate_limit(session_id):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit: max {RATE_LIMIT_REQUESTS} request per {RATE_LIMIT_WINDOW}s"
+        )
+    
+    # Получаем сессию
     session = get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -257,16 +317,16 @@ def process_chat_message(session_id: str, user_message: str) -> ChatResponse:
     messages = session.get("messages", [])
     old_summary = get_summary(session_id)
     
-    # Build context
-    context = build_context(old_summary, messages)
+    # Компактный контекст
+    context = build_compact_context(old_summary, messages)
     
-    # Prepare LLM messages
+    # LLM запрос
     llm_messages = []
     
     if context:
         llm_messages.append({
             "role": "system",
-            "content": f"You are a helpful AI assistant. Use this context from previous conversation:\n\n{context}"
+            "content": f"You are a helpful AI assistant.\n\nContext:\n{context}"
         })
     
     llm_messages.append({
@@ -274,10 +334,11 @@ def process_chat_message(session_id: str, user_message: str) -> ChatResponse:
         "content": user_message
     })
     
-    # Get AI response
-    ai_response = send_to_llm(llm_messages)
+    # Получаем ответ
+    result = await send_to_llm(llm_messages)
+    ai_response = result["content"]
     
-    # Update messages
+    # Сохраняем сообщения
     timestamp = datetime.utcnow().isoformat()
     messages.append({
         "role": "user",
@@ -290,28 +351,30 @@ def process_chat_message(session_id: str, user_message: str) -> ChatResponse:
         "timestamp": timestamp
     })
     
-    # Save messages
+    # Обновляем сессию
     update_session(session_id, messages)
     
-    # Update summary if needed
+    # Обновляем summary если нужно
     new_summary = None
     if len(messages) >= SUMMARY_THRESHOLD:
-        new_summary = generate_summary(old_summary, messages)
+        logger.info(f"📝 Generating summary for {session_id}")
+        new_summary = await generate_summary(old_summary, messages)
         update_summary(session_id, new_summary)
     
     return ChatResponse(
         session_id=session_id,
         response=ai_response,
         timestamp=timestamp,
-        summary=new_summary
+        summary=new_summary,
+        tokens_used=result.get("tokens_used")
     )
 
 ##################### FASTAPI APP ####################
 
 app = FastAPI(
-    title="AI Chat Server",
-    description="Production-ready AI chat server with session management and memory",
-    version="1.0.0"
+    title="AI Chat Server - Production",
+    description="Optimized AI chat server with rate limiting and concurrency control",
+    version="2.0.0"
 )
 
 # CORS
@@ -331,45 +394,58 @@ summary_router = APIRouter(prefix="/summary", tags=["summary"])
 ##################### HEALTH CHECK ####################
 
 @app.get("/health")
-def health_check():
-    """Health check endpoint"""
+async def health_check():
+    """Health check с детальной информацией"""
     try:
         r.ping()
         redis_status = "ok"
-    except:
-        redis_status = "error"
+    except Exception as e:
+        redis_status = f"error: {str(e)}"
     
     try:
-        requests.get(f"http://{QWEN_HOST}:{QWEN_PORT}/health", timeout=2)
-        llm_status = "ok"
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: requests.get(f"http://{QWEN_HOST}:{QWEN_PORT}/health", timeout=2)
+        )
+        llm_status = "ok" if response.status_code == 200 else "error"
     except:
-        llm_status = "error"
+        llm_status = "unreachable"
     
     return {
         "status": "ok" if redis_status == "ok" and llm_status == "ok" else "degraded",
         "redis": redis_status,
         "llm": llm_status,
+        "concurrency": {
+            "current": LLM_CONCURRENCY - llm_semaphore._value,
+            "max": LLM_CONCURRENCY,
+            "available": llm_semaphore._value
+        },
+        "config": {
+            "max_tokens": MAX_RESPONSE_TOKENS,
+            "max_history": MAX_HISTORY_LENGTH,
+            "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s"
+        },
         "timestamp": datetime.utcnow().isoformat()
     }
 
 ##################### CHAT ENDPOINTS ####################
 
 @chat_router.post("/", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    """Send a message and get AI response"""
+async def chat(req: ChatRequest):
+    """Send message and get AI response (with rate limiting)"""
     try:
-        return process_chat_message(req.session_id, req.message)
+        return await process_chat_message(req.session_id, req.message)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Chat error: {e}")
+        logger.error(f"✗ Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 ##################### SESSION ENDPOINTS ####################
 
 @session_router.post("/create")
 def create_new_session(req: SessionCreate = SessionCreate()):
-    """Create a new chat session"""
+    """Create new chat session"""
     session_id = create_session(req.metadata)
     return {
         "session_id": session_id,
@@ -378,7 +454,7 @@ def create_new_session(req: SessionCreate = SessionCreate()):
 
 @session_router.get("/{session_id}")
 def get_session_info(session_id: str):
-    """Get session information"""
+    """Get session info"""
     session = get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -386,7 +462,7 @@ def get_session_info(session_id: str):
 
 @session_router.delete("/{session_id}")
 def remove_session(session_id: str):
-    """Delete a session"""
+    """Delete session"""
     if not delete_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     return {"message": "Session deleted", "session_id": session_id}
@@ -411,7 +487,6 @@ def read_summary(session_id: str):
 @summary_router.post("/{session_id}")
 def edit_summary(session_id: str, req: SummaryUpdate):
     """Update session summary manually"""
-    # Check if session exists
     if not get_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -430,8 +505,8 @@ def remove_summary(session_id: str):
     return {"message": "Summary deleted", "session_id": session_id}
 
 @summary_router.post("/{session_id}/regenerate")
-def regenerate_summary(session_id: str):
-    """Regenerate summary from current messages"""
+async def regenerate_summary(session_id: str):
+    """Regenerate summary from messages"""
     session = get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -441,13 +516,32 @@ def regenerate_summary(session_id: str):
         raise HTTPException(status_code=400, detail="No messages to summarize")
     
     old_summary = get_summary(session_id)
-    new_summary = generate_summary(old_summary, messages)
+    new_summary = await generate_summary(old_summary, messages)
     update_summary(session_id, new_summary)
     
     return {
         "session_id": session_id,
         "summary": new_summary,
         "updated_at": datetime.utcnow().isoformat()
+    }
+
+##################### STATS ENDPOINT ####################
+
+@app.get("/stats")
+def get_stats():
+    """Server statistics"""
+    sessions = list_sessions(1000)
+    
+    return {
+        "total_sessions": len(sessions),
+        "active_rate_limits": len(rate_limit_tracker),
+        "llm_queue": LLM_CONCURRENCY - llm_semaphore._value,
+        "config": {
+            "max_tokens": MAX_RESPONSE_TOKENS,
+            "max_history": MAX_HISTORY_LENGTH,
+            "concurrency": LLM_CONCURRENCY,
+            "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s"
+        }
     }
 
 ##################### INCLUDE ROUTERS ####################
@@ -460,16 +554,33 @@ app.include_router(summary_router)
 
 @app.on_event("startup")
 async def startup_event():
+    logger.info("=" * 50)
+    logger.info("🚀 AI CHAT SERVER STARTING")
+    logger.info("=" * 50)
+    
     try:
         r.ping()
-        logger.info("✓ Redis connection successful")
+        logger.info("✓ Redis: CONNECTED")
     except Exception as e:
-        logger.error(f"✗ Redis connection failed: {e}")
+        logger.error(f"✗ Redis: FAILED - {e}")
+    
+    logger.info(f"⚙️  Config:")
+    logger.info(f"   • Max tokens: {MAX_RESPONSE_TOKENS}")
+    logger.info(f"   • Max history: {MAX_HISTORY_LENGTH}")
+    logger.info(f"   • Concurrency: {LLM_CONCURRENCY}")
+    logger.info(f"   • Rate limit: {RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s")
+    logger.info("=" * 50)
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("Shutting down server...")
+    logger.info("👋 Shutting down server...")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        workers=1,  # ВАЖНО: только 1 worker для LLM
+        log_level="info"
+    )
