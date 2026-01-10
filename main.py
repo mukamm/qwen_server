@@ -34,17 +34,16 @@ QWEN_TIMEOUT = 60
 
 SESSION_PREFIX = "session:"
 SUMMARY_PREFIX = "summary:"
-SESSION_PREFIX = "session:"
-SUMMARY_PREFIX = "summary:"
-PROFILE_PREFIX = "profile:"  # 🆕 USER PROFILE
-USER_PROFILE_PREFIX = "user_profile:"  # 🆕 ОБЩИЙ ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ
+USER_PROFILE_PREFIX = "user_profile:"
 SESSION_TTL = 86400 * 7  # 7 days
 
 # 🔥 КРИТИЧЕСКИЕ ОГРАНИЧЕНИЯ
-MAX_HISTORY_LENGTH = 6
+MAX_HISTORY_LENGTH = 30  # 🆕 Храним 30 сообщений в Redis
+CONTEXT_WINDOW = 6  # 🆕 Отправляем только 6 последних в LLM
 MAX_RESPONSE_TOKENS = 300
-MAX_SUMMARY_TOKENS = 150  # Уменьшили для компактности
+MAX_SUMMARY_TOKENS = 150
 SUMMARY_THRESHOLD = 8
+PROFILE_UPDATE_THRESHOLD = 5  # 🆕 Каждые 5 сообщений проверяем профиль
 
 # 🔒 ЗАЩИТА ОТ ПЕРЕГРУЗКИ
 LLM_CONCURRENCY = 2
@@ -87,25 +86,26 @@ def check_rate_limit(user_id: str, session_id: str) -> bool:
 ##################### PYDANTIC MODELS ####################
 
 class ChatRequest(BaseModel):
-    user_id: str  # 🆕 Обязательное поле
+    user_id: str
     session_id: str
     message: str
 
 class ChatResponse(BaseModel):
-    user_id: str  # 🆕
+    user_id: str
     session_id: str
     response: str
     timestamp: str
     summary: Optional[str] = None
+    profile_updated: Optional[bool] = None  # 🆕
     tokens_used: Optional[int] = None
 
 class SessionCreate(BaseModel):
-    user_id: str  # 🆕 Обязательное поле
+    user_id: str
     metadata: Optional[Dict[str, Any]] = None
 
 class ProfileUpdate(BaseModel):
-    user_id: str  # 🆕
-    profile_data: Dict[str, Any]  # Без session_id - это общий профиль
+    user_id: str
+    profile_data: Dict[str, Any]
 
 class SummaryUpdate(BaseModel):
     new_summary: str
@@ -115,24 +115,32 @@ class SummaryUpdate(BaseModel):
 def generate_id() -> str:
     return str(uuid.uuid4())
 
-##################### 🆕 PROFILE FUNCTIONS (ШАГ 1) ####################
+##################### 🆕 PROFILE FUNCTIONS WITH AUTO-EXTRACTION ####################
 
 def get_user_profile(user_id: str) -> Dict[str, Any]:
     """
-    🧠 ОБЩИЙ USER PROFILE - не привязан к session
-    Один профиль на всего пользователя
+    🧠 ОБЩИЙ USER PROFILE - один на всего пользователя
+    Автоматически обновляется из диалогов
     """
     key = f"{USER_PROFILE_PREFIX}{user_id}"
     data = r.get(key)
     
     if not data:
-        # Default profile
+        # Default profile structure
         return {
             "name": None,
-            "language": "en",
+            "age": None,
+            "location": None,
+            "occupation": None,
+            "company": None,
             "role": None,
-            "stack": [],
-            "preferences": {}
+            "tech_stack": [],
+            "interests": [],
+            "preferences": {},
+            "languages": [],
+            "projects": [],
+            "goals": [],
+            "other_facts": {}
         }
     
     return json.loads(data)
@@ -140,34 +148,39 @@ def get_user_profile(user_id: str) -> Dict[str, Any]:
 def update_user_profile(user_id: str, profile_data: Dict[str, Any]) -> None:
     """Обновление общего User Profile"""
     key = f"{USER_PROFILE_PREFIX}{user_id}"
-    r.set(key, json.dumps(profile_data), ex=SESSION_TTL * 4)  # Дольше живёт
+    r.set(key, json.dumps(profile_data), ex=SESSION_TTL * 4)
     logger.info(f"✓ User profile updated: {user_id}")
 
-def get_profile(user_id: str, session_id: str) -> Dict[str, Any]:
+def merge_profile_facts(old_profile: Dict[str, Any], new_facts: Dict[str, Any]) -> Dict[str, Any]:
     """
-    🧠 SESSION PROFILE - специфичный для сессии
-    Но по умолчанию берём из общего профиля
+    🔀 Умное слияние старого профиля с новыми фактами
+    - Обновляет существующие поля
+    - Добавляет новые элементы в списки (без дубликатов)
+    - Сохраняет структуру
     """
-    # Сначала пытаемся получить session-specific profile
-    key = f"{PROFILE_PREFIX}{user_id}:{session_id}"
-    data = r.get(key)
+    merged = old_profile.copy()
     
-    if data:
-        return json.loads(data)
+    for key, value in new_facts.items():
+        if key not in merged:
+            merged[key] = value
+        elif value is None:
+            continue  # Не перезаписываем null
+        elif isinstance(value, list):
+            # Для списков - добавляем уникальные элементы
+            if not isinstance(merged[key], list):
+                merged[key] = []
+            merged[key] = list(set(merged[key] + value))
+        elif isinstance(value, dict):
+            # Для словарей - мерджим
+            if not isinstance(merged[key], dict):
+                merged[key] = {}
+            merged[key].update(value)
+        else:
+            # Для простых значений - обновляем если новое не пустое
+            if value:
+                merged[key] = value
     
-    # Если нет - берём общий профиль пользователя
-    return get_user_profile(user_id)
-
-def update_profile(user_id: str, session_id: str, profile_data: Dict[str, Any]) -> None:
-    """Обновление Session Profile (редко)"""
-    key = f"{PROFILE_PREFIX}{user_id}:{session_id}"
-    r.set(key, json.dumps(profile_data), ex=SESSION_TTL)
-    logger.info(f"✓ Profile updated: {user_id}:{session_id}")
-
-def delete_profile(user_id: str, session_id: str) -> bool:
-    """Удаление профиля"""
-    key = f"{PROFILE_PREFIX}{user_id}:{session_id}"
-    return r.delete(key) > 0
+    return merged
 
 ##################### SESSION FUNCTIONS ####################
 
@@ -180,7 +193,8 @@ def create_session(user_id: str, metadata: Optional[Dict] = None) -> str:
         "created_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat(),
         "metadata": json.dumps(metadata or {}),
-        "message_count": "0"
+        "message_count": "0",
+        "last_profile_check": "0"  # 🆕 Отслеживаем когда проверяли профиль
     })
     r.expire(key, SESSION_TTL)
     
@@ -201,24 +215,30 @@ def get_session(user_id: str, session_id: str) -> Optional[Dict]:
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", ""),
         "metadata": json.loads(data.get("metadata", "{}")),
-        "message_count": int(data.get("message_count", 0))
+        "message_count": int(data.get("message_count", 0)),
+        "last_profile_check": int(data.get("last_profile_check", 0))
     }
 
-def update_session(user_id: str, session_id: str, messages: List[Dict]) -> bool:
+def update_session(user_id: str, session_id: str, messages: List[Dict], last_profile_check: Optional[int] = None) -> bool:
     key = f"{SESSION_PREFIX}{user_id}:{session_id}"
     
     if not r.exists(key):
         return False
     
-    # 💬 RECENT MESSAGES - только последние 6
+    # 💬 Храним до MAX_HISTORY_LENGTH сообщений
     if len(messages) > MAX_HISTORY_LENGTH:
         messages = messages[-MAX_HISTORY_LENGTH:]
     
-    r.hset(key, mapping={
+    update_data = {
         "messages": json.dumps(messages),
         "updated_at": datetime.utcnow().isoformat(),
         "message_count": str(len(messages))
-    })
+    }
+    
+    if last_profile_check is not None:
+        update_data["last_profile_check"] = str(last_profile_check)
+    
+    r.hset(key, mapping=update_data)
     r.expire(key, SESSION_TTL)
     
     return True
@@ -226,9 +246,8 @@ def update_session(user_id: str, session_id: str, messages: List[Dict]) -> bool:
 def delete_session(user_id: str, session_id: str) -> bool:
     session_key = f"{SESSION_PREFIX}{user_id}:{session_id}"
     summary_key = f"{SUMMARY_PREFIX}{user_id}:{session_id}"
-    profile_key = f"{PROFILE_PREFIX}{user_id}:{session_id}"
     
-    deleted = r.delete(session_key, summary_key, profile_key)
+    deleted = r.delete(session_key, summary_key)
     
     # Очистка rate limit
     rate_key = f"{user_id}:{session_id}"
@@ -245,7 +264,7 @@ def list_sessions(user_id: str, limit: int = 100) -> List[str]:
     session_ids = [k.replace(f"{SESSION_PREFIX}{user_id}:", "") for k in keys]
     return session_ids[:limit]
 
-##################### 📜 SUMMARY FUNCTIONS (ШАГ 2 - УЛУЧШЕННАЯ ЛОГИКА) ####################
+##################### 📜 SUMMARY FUNCTIONS ####################
 
 def get_summary(user_id: str, session_id: str) -> str:
     """Получение Conversation Summary"""
@@ -310,22 +329,13 @@ async def send_to_llm(messages: List[Dict[str, str]], temperature: float = 0.7, 
             raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 async def generate_summary(old_summary: str, messages: List[Dict]) -> str:
-    """
-    📜 НОВАЯ ЛОГИКА SUMMARY (ШАГ 2)
+    """Generate conversation summary"""
     
-    ❌ НЕ: "кратко перескажи весь диалог"
-    ✅ А: "опиши цель разговора и текущий этап"
-    
-    Summary = состояние задачи, а не история
-    """
-    
-    # Берём только последние 4 сообщения
     recent_messages = "\n".join([
         f"{m['role'].capitalize()}: {m['content'][:150]}"
         for m in messages[-4:]
     ])
     
-    # 🎯 НОВЫЙ PROMPT - ФОКУС НА ЗАДАЧЕ, НЕ НА ИСТОРИИ
     prompt = f"""Analyze this conversation and describe the current state.
 
 Previous summary: {old_summary if old_summary else "New conversation"}
@@ -355,30 +365,121 @@ Be task-focused and concise."""
         logger.error(f"✗ Summary generation failed: {e}")
         return old_summary
 
-##################### 🎯 CHAT PROCESSING (УЛУЧШЕННАЯ СБОРКА PROMPT) ####################
+async def extract_user_facts(messages: List[Dict], current_profile: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    🧠 АВТОМАТИЧЕСКАЯ ЭКСТРАКЦИЯ ФАКТОВ О ПОЛЬЗОВАТЕЛЕ
+    
+    Анализирует последние сообщения и извлекает:
+    - Имя, возраст, локацию
+    - Профессию, компанию, роль
+    - Технологии, интересы
+    - Проекты, цели
+    - Любые другие упомянутые факты
+    """
+    
+    # Берём последние 10 сообщений пользователя для анализа
+    user_messages = [m for m in messages if m.get("role") == "user"][-10:]
+    
+    if not user_messages:
+        return current_profile
+    
+    conversation_text = "\n".join([
+        f"User: {m['content']}"
+        for m in user_messages
+    ])
+    
+    # Показываем текущий профиль для контекста
+    current_facts = json.dumps(current_profile, indent=2, ensure_ascii=False)
+    
+    prompt = f"""Extract user facts from this conversation. Update or add new information.
+
+CURRENT PROFILE:
+{current_facts}
+
+RECENT USER MESSAGES:
+{conversation_text}
+
+Extract and return ONLY NEW or UPDATED facts in JSON format:
+{{
+  "name": "actual name if mentioned",
+  "age": number or null,
+  "location": "city/country if mentioned",
+  "occupation": "job title",
+  "company": "company name",
+  "role": "professional role",
+  "tech_stack": ["technology1", "technology2"],
+  "interests": ["interest1", "interest2"],
+  "languages": ["language1", "language2"],
+  "projects": ["project1", "project2"],
+  "goals": ["goal1", "goal2"],
+  "preferences": {{"key": "value"}},
+  "other_facts": {{"custom_key": "custom_value"}}
+}}
+
+RULES:
+1. Return ONLY fields that have NEW or UPDATED information
+2. If user corrects their name (e.g., "My real name is Batyr"), update "name": "Batyr"
+3. Extract tech stack from mentions like "I use Python", "working with React"
+4. For lists, return only NEW items to add
+5. Use null for unknown fields
+6. Return valid JSON only, no explanations
+
+Example:
+User says: "My name is John, I'm a Python developer"
+Return: {{"name": "John", "tech_stack": ["Python"], "occupation": "developer"}}"""
+
+    llm_messages = [{"role": "user", "content": prompt}]
+    
+    try:
+        result = await send_to_llm(llm_messages, temperature=0.1, max_tokens=300)
+        response_text = result["content"].strip()
+        
+        # Извлекаем JSON из ответа
+        # Ищем JSON между фигурными скобками
+        import re
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        
+        if json_match:
+            extracted_facts = json.loads(json_match.group())
+            logger.info(f"✓ Extracted facts: {extracted_facts}")
+            return extracted_facts
+        else:
+            logger.warning("✗ No valid JSON found in profile extraction")
+            return {}
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"✗ JSON decode error in profile extraction: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"✗ Profile extraction failed: {e}")
+        return {}
+
+##################### 🎯 CHAT PROCESSING ####################
 
 def build_system_prompt(profile: Dict[str, Any], summary: str, messages: List[Dict]) -> str:
     """
-    🔑 КЛЮЧЕВАЯ ФУНКЦИЯ - ПРАВИЛЬНАЯ СБОРКА КОНТЕКСТА
-    
-    Структура:
-    1. USER PROFILE (стабильное)
-    2. CONVERSATION SUMMARY (динамическое)
-    3. RECENT MESSAGES (живой контекст)
+    🔑 Сборка контекста для LLM
+    Использует только последние CONTEXT_WINDOW сообщений
     """
     
     parts = ["You are a helpful AI assistant."]
     
-    # 🧠 A. USER PROFILE (если есть данные)
+    # 🧠 A. USER PROFILE
     profile_parts = []
     if profile.get("name"):
         profile_parts.append(f"User name: {profile['name']}")
-    if profile.get("language"):
-        profile_parts.append(f"Preferred language: {profile['language']}")
-    if profile.get("role"):
-        profile_parts.append(f"Role: {profile['role']}")
-    if profile.get("stack"):
-        profile_parts.append(f"Tech stack: {', '.join(profile['stack'])}")
+    if profile.get("age"):
+        profile_parts.append(f"Age: {profile['age']}")
+    if profile.get("location"):
+        profile_parts.append(f"Location: {profile['location']}")
+    if profile.get("occupation"):
+        profile_parts.append(f"Occupation: {profile['occupation']}")
+    if profile.get("company"):
+        profile_parts.append(f"Company: {profile['company']}")
+    if profile.get("tech_stack"):
+        profile_parts.append(f"Tech stack: {', '.join(profile['tech_stack'][:5])}")
+    if profile.get("interests"):
+        profile_parts.append(f"Interests: {', '.join(profile['interests'][:5])}")
     
     if profile_parts:
         parts.append("\nUSER PROFILE:\n" + "\n".join(profile_parts))
@@ -387,9 +488,9 @@ def build_system_prompt(profile: Dict[str, Any], summary: str, messages: List[Di
     if summary:
         parts.append(f"\nCONVERSATION SUMMARY:\n{summary[:300]}")
     
-    # 💬 C. RECENT MESSAGES (последние 4)
+    # 💬 C. RECENT MESSAGES (только последние CONTEXT_WINDOW)
     if messages:
-        recent = messages[-4:] if len(messages) > 4 else messages
+        recent = messages[-CONTEXT_WINDOW:]
         history = "\n".join([
             f"{m['role'].capitalize()}: {m['content'][:200]}"
             for m in recent
@@ -399,7 +500,7 @@ def build_system_prompt(profile: Dict[str, Any], summary: str, messages: List[Di
     return "\n".join(parts)
 
 async def process_chat_message(user_id: str, session_id: str, user_message: str) -> ChatResponse:
-    """Обработка сообщения с новой архитектурой памяти"""
+    """Обработка сообщения с автоматическим обновлением профиля"""
     
     # Rate limit
     if not check_rate_limit(user_id, session_id):
@@ -414,12 +515,14 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         raise HTTPException(status_code=404, detail="Session not found")
     
     messages = session.get("messages", [])
+    message_count = len(messages)
+    last_profile_check = session.get("last_profile_check", 0)
     
-    # 🆕 Получаем ВСЕ 3 типа памяти
-    profile = get_profile(user_id, session_id)
+    # Получаем профиль и summary
+    profile = get_user_profile(user_id)
     summary = get_summary(user_id, session_id)
     
-    # 🎯 Собираем правильный system prompt
+    # 🎯 Собираем system prompt (с последними CONTEXT_WINDOW сообщениями)
     system_content = build_system_prompt(profile, summary, messages)
     
     # LLM запрос
@@ -432,7 +535,7 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
     result = await send_to_llm(llm_messages)
     ai_response = result["content"]
     
-    # Сохраняем сообщения
+    # Сохраняем сообщения (ВСЕ, до MAX_HISTORY_LENGTH)
     timestamp = datetime.utcnow().isoformat()
     messages.append({
         "role": "user",
@@ -445,8 +548,28 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         "timestamp": timestamp
     })
     
-    # Обновляем сессию
-    update_session(user_id, session_id, messages)
+    # 🧠 ПРОВЕРКА ПРОФИЛЯ - каждые PROFILE_UPDATE_THRESHOLD сообщений
+    profile_updated = False
+    new_message_count = len(messages)
+    
+    if new_message_count - last_profile_check >= PROFILE_UPDATE_THRESHOLD:
+        logger.info(f"🧠 Checking profile for {user_id} (messages: {new_message_count})")
+        
+        # Извлекаем новые факты
+        extracted_facts = await extract_user_facts(messages, profile)
+        
+        if extracted_facts:
+            # Мерджим с существующим профилем
+            updated_profile = merge_profile_facts(profile, extracted_facts)
+            update_user_profile(user_id, updated_profile)
+            profile_updated = True
+            logger.info(f"✓ Profile updated with new facts: {list(extracted_facts.keys())}")
+        
+        # Обновляем last_profile_check
+        update_session(user_id, session_id, messages, last_profile_check=new_message_count)
+    else:
+        # Обычное обновление сессии
+        update_session(user_id, session_id, messages)
     
     # Обновляем summary если нужно
     new_summary = None
@@ -461,15 +584,16 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         response=ai_response,
         timestamp=timestamp,
         summary=new_summary,
+        profile_updated=profile_updated,
         tokens_used=result.get("tokens_used")
     )
 
 ##################### FASTAPI APP ####################
 
 app = FastAPI(
-    title="AI Chat Server - Memory Architecture v2",
-    description="3-tier memory: Profile + Summary + Recent Messages",
-    version="2.0.0"
+    title="AI Chat Server - Auto Profile Memory",
+    description="3-tier memory with automatic profile extraction",
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -509,13 +633,13 @@ async def health_check():
         "redis": redis_status,
         "llm": llm_status,
         "memory_architecture": {
-            "profile": "stable facts",
+            "profile": "auto-extracted user facts",
             "summary": "conversation state",
-            "recent": "last 6 messages"
+            "history": f"last {MAX_HISTORY_LENGTH} messages stored",
+            "context": f"last {CONTEXT_WINDOW} messages sent to LLM"
         },
-        "concurrency": {
-            "current": LLM_CONCURRENCY - llm_semaphore._value,
-            "max": LLM_CONCURRENCY
+        "config": {
+            "profile_check_interval": f"every {PROFILE_UPDATE_THRESHOLD} messages"
         },
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -524,7 +648,7 @@ async def health_check():
 
 @chat_router.post("/", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """Send message (requires user_id + session_id)"""
+    """Send message with auto profile extraction"""
     try:
         return await process_chat_message(req.user_id, req.session_id, req.message)
     except HTTPException:
@@ -537,7 +661,7 @@ async def chat(req: ChatRequest):
 
 @session_router.post("/create")
 def create_new_session(req: SessionCreate):
-    """Create new session (requires user_id)"""
+    """Create new session"""
     session_id = create_session(req.user_id, req.metadata)
     return {
         "user_id": req.user_id,
@@ -547,7 +671,7 @@ def create_new_session(req: SessionCreate):
 
 @session_router.get("/{user_id}/{session_id}")
 def get_session_info(user_id: str, session_id: str):
-    """Get session info"""
+    """Get session info with full history"""
     session = get_session(user_id, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -566,43 +690,59 @@ def get_user_sessions(user_id: str, limit: int = 100):
     sessions = list_sessions(user_id, limit)
     return {"user_id": user_id, "sessions": sessions, "count": len(sessions)}
 
-##################### 🆕 PROFILE ENDPOINTS ####################
+##################### PROFILE ENDPOINTS ####################
 
 @profile_router.get("/{user_id}")
 def read_user_profile(user_id: str):
-    """Get общий user profile (не привязан к session)"""
+    """Get user profile (auto-extracted)"""
     profile = get_user_profile(user_id)
     return {
         "user_id": user_id,
         "profile": profile
     }
 
-@profile_router.get("/{user_id}/{session_id}")
-def read_session_profile(user_id: str, session_id: str):
-    """Get session-specific profile (или общий если нет)"""
-    profile = get_profile(user_id, session_id)
-    return {
-        "user_id": user_id,
-        "session_id": session_id,
-        "profile": profile
-    }
-
 @profile_router.post("/update")
 def edit_user_profile(req: ProfileUpdate):
-    """Update общий user profile"""
-    update_user_profile(req.user_id, req.profile_data)
+    """Manually update user profile"""
+    current = get_user_profile(req.user_id)
+    merged = merge_profile_facts(current, req.profile_data)
+    update_user_profile(req.user_id, merged)
     return {
         "user_id": req.user_id,
-        "profile": req.profile_data,
+        "profile": merged,
         "updated_at": datetime.utcnow().isoformat()
     }
 
-@profile_router.delete("/{user_id}/{session_id}")
-def remove_profile(user_id: str, session_id: str):
-    """Delete session profile"""
-    if not delete_profile(user_id, session_id):
-        raise HTTPException(status_code=404, detail="Profile not found")
-    return {"message": "Profile deleted", "user_id": user_id, "session_id": session_id}
+@profile_router.post("/{user_id}/extract")
+async def force_profile_extraction(user_id: str, session_id: str):
+    """Force profile extraction from current session"""
+    session = get_session(user_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    messages = session.get("messages", [])
+    if not messages:
+        raise HTTPException(status_code=400, detail="No messages to analyze")
+    
+    current_profile = get_user_profile(user_id)
+    extracted_facts = await extract_user_facts(messages, current_profile)
+    
+    if extracted_facts:
+        updated_profile = merge_profile_facts(current_profile, extracted_facts)
+        update_user_profile(user_id, updated_profile)
+        
+        return {
+            "user_id": user_id,
+            "extracted_facts": extracted_facts,
+            "updated_profile": updated_profile,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+    
+    return {
+        "user_id": user_id,
+        "message": "No new facts extracted",
+        "current_profile": current_profile
+    }
 
 ##################### SUMMARY ENDPOINTS ####################
 
@@ -670,8 +810,10 @@ def get_stats():
         "config": {
             "max_tokens": MAX_RESPONSE_TOKENS,
             "max_history": MAX_HISTORY_LENGTH,
+            "context_window": CONTEXT_WINDOW,
             "concurrency": LLM_CONCURRENCY,
-            "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s"
+            "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s",
+            "profile_update_threshold": PROFILE_UPDATE_THRESHOLD
         }
     }
 
@@ -687,7 +829,7 @@ app.include_router(profile_router)
 @app.on_event("startup")
 async def startup_event():
     logger.info("=" * 60)
-    logger.info("🚀 AI CHAT SERVER - MEMORY ARCHITECTURE v2")
+    logger.info("🚀 AI CHAT SERVER - AUTO PROFILE MEMORY v3")
     logger.info("=" * 60)
     
     try:
@@ -697,13 +839,16 @@ async def startup_event():
         logger.error(f"✗ Redis: FAILED - {e}")
     
     logger.info("📚 Memory Architecture:")
-    logger.info("   🧠 Profile: stable user facts")
+    logger.info("   🧠 Profile: auto-extracted user facts (one per user)")
     logger.info("   📜 Summary: conversation state")
-    logger.info("   💬 Recent: last 6 messages")
+    logger.info(f"   💾 History: last {MAX_HISTORY_LENGTH} messages stored")
+    logger.info(f"   💬 Context: last {CONTEXT_WINDOW} messages sent to LLM")
     logger.info("")
     logger.info(f"⚙️  Config:")
     logger.info(f"   • Max tokens: {MAX_RESPONSE_TOKENS}")
-    logger.info(f"   • Max history: {MAX_HISTORY_LENGTH}")
+    logger.info(f"   • Max history: {MAX_HISTORY_LENGTH} (stored)")
+    logger.info(f"   • Context window: {CONTEXT_WINDOW} (sent to LLM)")
+    logger.info(f"   • Profile check: every {PROFILE_UPDATE_THRESHOLD} messages")
     logger.info(f"   • Concurrency: {LLM_CONCURRENCY}")
     logger.info(f"   • Rate limit: {RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s")
     logger.info("=" * 60)
