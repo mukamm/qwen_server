@@ -11,6 +11,7 @@ import asyncio
 from datetime import datetime
 from collections import defaultdict
 import time
+import re
 
 ##################### LOGGING ####################
 
@@ -32,23 +33,29 @@ QWEN_PORT = 8001
 QWEN_MODEL = "qwen-7b-instruct"
 QWEN_TIMEOUT = 60
 
+# Redis prefixes
 SESSION_PREFIX = "session:"
 SUMMARY_PREFIX = "summary:"
 USER_PROFILE_PREFIX = "user_profile:"
+DIALOG_STATE_PREFIX = "dialog_state:"  # 🆕 INTENT STORAGE
 SESSION_TTL = 86400 * 7  # 7 days
 
-# 🔥 КРИТИЧЕСКИЕ ОГРАНИЧЕНИЯ
-MAX_HISTORY_LENGTH = 30  # 🆕 Храним 30 сообщений в Redis
-CONTEXT_WINDOW = 6  # 🆕 Отправляем только 6 последних в LLM
+# Memory limits
+MAX_HISTORY_LENGTH = 30
+CONTEXT_WINDOW = 6
 MAX_RESPONSE_TOKENS = 300
 MAX_SUMMARY_TOKENS = 150
 SUMMARY_THRESHOLD = 8
-PROFILE_UPDATE_THRESHOLD = 5  # 🆕 Каждые 5 сообщений проверяем профиль
+PROFILE_UPDATE_THRESHOLD = 5
 
-# 🔒 ЗАЩИТА ОТ ПЕРЕГРУЗКИ
+# Concurrency
 LLM_CONCURRENCY = 2
 RATE_LIMIT_REQUESTS = 1
 RATE_LIMIT_WINDOW = 3
+
+# 🆕 USER LEVELS
+USER_LEVELS = ["beginner", "junior", "middle", "senior", "expert"]
+RESPONSE_MODES = ["learn", "debug", "inspect", "design", "quick"]
 
 ##################### REDIS CONNECTION ####################
 
@@ -68,7 +75,6 @@ llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 rate_limit_tracker: Dict[str, List[float]] = defaultdict(list)
 
 def check_rate_limit(user_id: str, session_id: str) -> bool:
-    """Rate limit по user_id:session_id"""
     key = f"{user_id}:{session_id}"
     now = time.time()
     
@@ -95,9 +101,11 @@ class ChatResponse(BaseModel):
     session_id: str
     response: str
     timestamp: str
+    intent: Optional[Dict[str, Any]] = None
     summary: Optional[str] = None
-    profile_updated: Optional[bool] = None  # 🆕
+    profile_updated: Optional[bool] = None
     tokens_used: Optional[int] = None
+    rules_applied: Optional[List[str]] = None  # 🆕
 
 class SessionCreate(BaseModel):
     user_id: str
@@ -107,80 +115,110 @@ class ProfileUpdate(BaseModel):
     user_id: str
     profile_data: Dict[str, Any]
 
-class SummaryUpdate(BaseModel):
-    new_summary: str
-
 ##################### UTILITIES ####################
 
 def generate_id() -> str:
     return str(uuid.uuid4())
 
-##################### 🆕 PROFILE FUNCTIONS WITH AUTO-EXTRACTION ####################
+##################### 🆕 STEP 2: USER PROFILE (PASSPORT) ####################
 
 def get_user_profile(user_id: str) -> Dict[str, Any]:
     """
-    🧠 ОБЩИЙ USER PROFILE - один на всего пользователя
-    Автоматически обновляется из диалогов
+    📋 USER PROFILE = ПАСПОРТ ПОЛЬЗОВАТЕЛЯ
+    
+    Хранит ТОЛЬКО стабильные факты:
+    - имя
+    - возраст
+    - роль (student/engineer/designer)
+    - уровень (beginner/junior/middle/senior/expert)
+    - технологии
+    - язык общения
+    
+    НЕ ХРАНИТ:
+    - текущую задачу
+    - эмоции
+    - последние вопросы
     """
     key = f"{USER_PROFILE_PREFIX}{user_id}"
     data = r.get(key)
     
     if not data:
-        # Default profile structure
         return {
             "name": None,
             "age": None,
-            "location": None,
-            "occupation": None,
-            "company": None,
-            "role": None,
+            "role": None,  # student/engineer/designer/etc
+            "level": "junior",  # beginner/junior/middle/senior/expert
             "tech_stack": [],
+            "language": "en",  # en/ru/etc
             "interests": [],
-            "preferences": {},
-            "languages": [],
-            "projects": [],
-            "goals": [],
-            "other_facts": {}
+            "learning_goals": []
         }
     
     return json.loads(data)
 
 def update_user_profile(user_id: str, profile_data: Dict[str, Any]) -> None:
-    """Обновление общего User Profile"""
     key = f"{USER_PROFILE_PREFIX}{user_id}"
     r.set(key, json.dumps(profile_data), ex=SESSION_TTL * 4)
-    logger.info(f"✓ User profile updated: {user_id}")
+    logger.info(f"✓ Profile updated: {user_id}")
 
-def merge_profile_facts(old_profile: Dict[str, Any], new_facts: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    🔀 Умное слияние старого профиля с новыми фактами
-    - Обновляет существующие поля
-    - Добавляет новые элементы в списки (без дубликатов)
-    - Сохраняет структуру
-    """
-    merged = old_profile.copy()
+def merge_profile_facts(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    merged = old.copy()
     
-    for key, value in new_facts.items():
+    for key, value in new.items():
         if key not in merged:
             merged[key] = value
         elif value is None:
-            continue  # Не перезаписываем null
+            continue
         elif isinstance(value, list):
-            # Для списков - добавляем уникальные элементы
             if not isinstance(merged[key], list):
                 merged[key] = []
             merged[key] = list(set(merged[key] + value))
         elif isinstance(value, dict):
-            # Для словарей - мерджим
             if not isinstance(merged[key], dict):
                 merged[key] = {}
             merged[key].update(value)
         else:
-            # Для простых значений - обновляем если новое не пустое
             if value:
                 merged[key] = value
     
     return merged
+
+##################### 🆕 STEP 3: DIALOG STATE (INTENT) ####################
+
+def get_dialog_state(user_id: str, session_id: str) -> Dict[str, Any]:
+    """
+    🎯 DIALOG STATE = ТЕКУЩАЯ ЦЕЛЬ И КОНТЕКСТ
+    
+    Отвечает на вопросы:
+    - Что пользователь хочет СЕЙЧАС?
+    - В каком режиме работаем? (learn/debug/inspect/design)
+    - Какой уровень детализации нужен?
+    - Что УЖЕ понятно?
+    - Что ЗАПРЕЩЕНО объяснять?
+    
+    БЕЗ ЭТОГО LLM ВСЕГДА БУДЕТ ТУПИТЬ
+    """
+    key = f"{DIALOG_STATE_PREFIX}{user_id}:{session_id}"
+    data = r.get(key)
+    
+    if not data:
+        return {
+            "current_goal": None,  # "learn React", "debug error", "design system"
+            "mode": "learn",  # learn/debug/inspect/design/quick
+            "detail_level": "normal",  # brief/normal/detailed
+            "understood_concepts": [],  # что уже понятно
+            "forbidden_topics": [],  # что НЕ объяснять
+            "context_type": None,  # code/theory/architecture/practice
+            "last_updated": None
+        }
+    
+    return json.loads(data)
+
+def update_dialog_state(user_id: str, session_id: str, state: Dict[str, Any]) -> None:
+    key = f"{DIALOG_STATE_PREFIX}{user_id}:{session_id}"
+    state["last_updated"] = datetime.utcnow().isoformat()
+    r.set(key, json.dumps(state), ex=SESSION_TTL)
+    logger.info(f"✓ Dialog state updated: {state.get('current_goal', 'unknown')}")
 
 ##################### SESSION FUNCTIONS ####################
 
@@ -194,7 +232,7 @@ def create_session(user_id: str, metadata: Optional[Dict] = None) -> str:
         "updated_at": datetime.utcnow().isoformat(),
         "metadata": json.dumps(metadata or {}),
         "message_count": "0",
-        "last_profile_check": "0"  # 🆕 Отслеживаем когда проверяли профиль
+        "last_profile_check": "0"
     })
     r.expire(key, SESSION_TTL)
     
@@ -225,7 +263,6 @@ def update_session(user_id: str, session_id: str, messages: List[Dict], last_pro
     if not r.exists(key):
         return False
     
-    # 💬 Храним до MAX_HISTORY_LENGTH сообщений
     if len(messages) > MAX_HISTORY_LENGTH:
         messages = messages[-MAX_HISTORY_LENGTH:]
     
@@ -246,10 +283,10 @@ def update_session(user_id: str, session_id: str, messages: List[Dict], last_pro
 def delete_session(user_id: str, session_id: str) -> bool:
     session_key = f"{SESSION_PREFIX}{user_id}:{session_id}"
     summary_key = f"{SUMMARY_PREFIX}{user_id}:{session_id}"
+    state_key = f"{DIALOG_STATE_PREFIX}{user_id}:{session_id}"
     
-    deleted = r.delete(session_key, summary_key)
+    deleted = r.delete(session_key, summary_key, state_key)
     
-    # Очистка rate limit
     rate_key = f"{user_id}:{session_id}"
     if rate_key in rate_limit_tracker:
         del rate_limit_tracker[rate_key]
@@ -257,38 +294,260 @@ def delete_session(user_id: str, session_id: str) -> bool:
     logger.info(f"✓ Session deleted: {user_id}:{session_id}")
     return deleted > 0
 
-def list_sessions(user_id: str, limit: int = 100) -> List[str]:
-    """Список сессий конкретного пользователя"""
-    pattern = f"{SESSION_PREFIX}{user_id}:*"
-    keys = r.keys(pattern)
-    session_ids = [k.replace(f"{SESSION_PREFIX}{user_id}:", "") for k in keys]
-    return session_ids[:limit]
-
-##################### 📜 SUMMARY FUNCTIONS ####################
+##################### 🆕 STEP 4: SUMMARY (ТОЧКА НА КАРТЕ) ####################
 
 def get_summary(user_id: str, session_id: str) -> str:
-    """Получение Conversation Summary"""
     key = f"{SUMMARY_PREFIX}{user_id}:{session_id}"
     data = r.get(key)
     return data if data else ""
 
 def update_summary(user_id: str, session_id: str, summary: str) -> None:
-    """Обновление summary"""
     key = f"{SUMMARY_PREFIX}{user_id}:{session_id}"
     r.set(key, summary, ex=SESSION_TTL)
     logger.info(f"✓ Summary updated: {user_id}:{session_id}")
 
-def delete_summary(user_id: str, session_id: str) -> bool:
-    key = f"{SUMMARY_PREFIX}{user_id}:{session_id}"
-    return r.delete(key) > 0
+async def generate_summary(old_summary: str, messages: List[Dict]) -> str:
+    """
+    📍 SUMMARY = ТОЧКА НА КАРТЕ
+    
+    Отвечает ТОЛЬКО на:
+    - О чём диалог СЕЙЧАС?
+    - К какому результату идём?
+    - Что уже решено?
+    
+    НЕ ДОЛЖЕН:
+    - Пересказывать всю историю
+    - Содержать старые темы
+    """
+    
+    recent = "\n".join([
+        f"{m['role'].capitalize()}: {m['content'][:150]}"
+        for m in messages[-4:]
+    ])
+    
+    prompt = f"""Analyze current dialog state.
+
+Previous state: {old_summary if old_summary else "New conversation"}
+
+Recent exchange:
+{recent}
+
+Create concise summary (max 80 words) answering ONLY:
+1. What is the CURRENT topic/goal?
+2. What result are we working toward?
+3. What has been DECIDED/SOLVED?
+
+FORBIDDEN:
+- Full history retelling
+- Old/resolved topics
+- User personal details
+
+Focus on CURRENT STATE, not past."""
+
+    llm_messages = [{"role": "user", "content": prompt}]
+    
+    try:
+        result = await send_to_llm(llm_messages, temperature=0.3, max_tokens=MAX_SUMMARY_TOKENS)
+        return result["content"].strip()
+    except Exception as e:
+        logger.error(f"✗ Summary generation failed: {e}")
+        return old_summary
+
+##################### 🆕 STEP 3: INTENT EXTRACTION ####################
+
+async def extract_intent(user_message: str, current_state: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    🎯 ИЗВЛЕЧЕНИЕ DIALOG STATE ИЗ СООБЩЕНИЯ
+    
+    Определяет:
+    - current_goal: что хочет пользователь
+    - mode: learn/debug/inspect/design/quick
+    - detail_level: brief/normal/detailed
+    - understood_concepts: что УЖЕ понятно
+    - forbidden_topics: что НЕ объяснять
+    """
+    
+    current_goal = current_state.get("current_goal", "unknown")
+    understood = ", ".join(current_state.get("understood_concepts", [])[:5])
+    
+    prompt = f"""Extract dialog intent from user message.
+
+USER LEVEL: {profile.get('level', 'junior')}
+CURRENT GOAL: {current_goal}
+UNDERSTOOD: {understood}
+
+USER MESSAGE: "{user_message}"
+
+Determine and return JSON:
+{{
+  "current_goal": "brief description of what user wants NOW",
+  "mode": "learn|debug|inspect|design|quick",
+  "detail_level": "brief|normal|detailed",
+  "understood_concepts": ["concept1", "concept2"],
+  "forbidden_topics": ["basics", "already explained"],
+  "context_type": "code|theory|architecture|practice"
+}}
+
+RULES:
+- If user says "I know X" → add X to understood_concepts, forbidden_topics
+- If user asks "how to debug" → mode: "debug"
+- If user asks "explain" → mode: "learn"
+- If user asks "show code" → mode: "inspect"
+- If user says "briefly" → detail_level: "brief"
+- Return ONLY valid JSON, no text."""
+
+    llm_messages = [{"role": "user", "content": prompt}]
+    
+    try:
+        result = await send_to_llm(llm_messages, temperature=0.1, max_tokens=200)
+        response = result["content"].strip()
+        
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            intent = json.loads(json_match.group())
+            logger.info(f"✓ Intent extracted: {intent.get('mode')} - {intent.get('current_goal')}")
+            return intent
+        
+        logger.warning("✗ No JSON in intent extraction")
+        return current_state
+        
+    except Exception as e:
+        logger.error(f"✗ Intent extraction failed: {e}")
+        return current_state
+
+##################### 🆕 STEP 6: CONTROLLER (ПРАВИЛА) ####################
+
+def build_response_rules(profile: Dict[str, Any], state: Dict[str, Any]) -> List[str]:
+    """
+    🚦 CONTROLLER - ПРАВИЛА ОТВЕТА
+    
+    Решает перед КАЖДЫМ ответом:
+    - Можно ли давать код?
+    - Можно ли повторять?
+    - Можно ли объяснять базу?
+    - Можно ли уходить в сторону?
+    
+    LLM = ИСПОЛНИТЕЛЬ
+    BACKEND = МОЗГ
+    """
+    
+    rules = []
+    
+    level = profile.get("level", "junior")
+    mode = state.get("mode", "learn")
+    detail_level = state.get("detail_level", "normal")
+    understood = state.get("understood_concepts", [])
+    forbidden = state.get("forbidden_topics", [])
+    
+    # 1. Правила по уровню
+    if level == "beginner":
+        rules.append("Explain like to a beginner, use simple terms")
+        rules.append("Include basic examples")
+        rules.append("NO assumptions about prior knowledge")
+    elif level in ["middle", "senior", "expert"]:
+        rules.append("Skip basic explanations")
+        rules.append("Use technical terms freely")
+        rules.append("Focus on advanced concepts")
+    
+    # 2. Правила по режиму
+    if mode == "debug":
+        rules.append("Focus on finding the error")
+        rules.append("Provide specific solution, not theory")
+        rules.append("Show corrected code")
+    elif mode == "quick":
+        rules.append("Answer in 1-2 sentences maximum")
+        rules.append("NO long explanations")
+    elif mode == "design":
+        rules.append("Focus on architecture and patterns")
+        rules.append("Explain trade-offs")
+    
+    # 3. Правила по детализации
+    if detail_level == "brief":
+        rules.append("Keep response under 100 words")
+        rules.append("Only essential information")
+    elif detail_level == "detailed":
+        rules.append("Provide thorough explanation")
+        rules.append("Include examples and edge cases")
+    
+    # 4. Запреты
+    if understood:
+        rules.append(f"DO NOT explain these (user knows): {', '.join(understood[:3])}")
+    
+    if forbidden:
+        rules.append(f"FORBIDDEN topics: {', '.join(forbidden[:3])}")
+    
+    # 5. Общие правила
+    rules.append("NO repetition of previous answers")
+    rules.append("Stay on topic, no tangents")
+    rules.append("If asked something off-topic, politely redirect")
+    
+    return rules
+
+##################### 🆕 STEP 7: SMART PROMPT ASSEMBLY ####################
+
+def build_system_prompt(profile: Dict[str, Any], state: Dict[str, Any], summary: str, messages: List[Dict]) -> str:
+    """
+    🧠 УМНАЯ СБОРКА ПРОМПТА
+    
+    Собирает контекст из:
+    1. Краткий профиль (паспорт)
+    2. Dialog state (текущая цель)
+    3. Summary (где мы сейчас)
+    4. Жёсткие правила ответа
+    5. Только последние CONTEXT_WINDOW сообщений
+    """
+    
+    parts = ["You are a helpful AI assistant."]
+    
+    # 1. USER PROFILE (PASSPORT)
+    profile_lines = []
+    if profile.get("name"):
+        profile_lines.append(f"Name: {profile['name']}")
+    if profile.get("role"):
+        profile_lines.append(f"Role: {profile['role']}")
+    profile_lines.append(f"Level: {profile.get('level', 'junior')}")
+    if profile.get("tech_stack"):
+        profile_lines.append(f"Tech: {', '.join(profile['tech_stack'][:3])}")
+    
+    if profile_lines:
+        parts.append(f"\nUSER PROFILE:\n" + "\n".join(profile_lines))
+    
+    # 2. DIALOG STATE (INTENT)
+    if state.get("current_goal"):
+        parts.append(f"\nCURRENT GOAL: {state['current_goal']}")
+        parts.append(f"MODE: {state.get('mode', 'learn')}")
+        parts.append(f"DETAIL LEVEL: {state.get('detail_level', 'normal')}")
+    
+    if state.get("understood_concepts"):
+        parts.append(f"USER ALREADY KNOWS: {', '.join(state['understood_concepts'][:5])}")
+    
+    # 3. SUMMARY (WHERE WE ARE)
+    if summary:
+        parts.append(f"\nCONVERSATION STATE:\n{summary[:250]}")
+    
+    # 4. RESPONSE RULES
+    rules = build_response_rules(profile, state)
+    if rules:
+        parts.append("\nRESPONSE RULES:")
+        for rule in rules[:8]:  # max 8 rules
+            parts.append(f"- {rule}")
+    
+    # 5. RECENT MESSAGES (only last CONTEXT_WINDOW)
+    if messages:
+        recent = messages[-CONTEXT_WINDOW:]
+        history = "\n".join([
+            f"{m['role'].capitalize()}: {m['content'][:200]}"
+            for m in recent
+        ])
+        parts.append(f"\nRECENT EXCHANGE:\n{history}")
+    
+    return "\n".join(parts)
 
 ##################### LLM CLIENT ####################
 
 BASE_URL = f"http://{QWEN_HOST}:{QWEN_PORT}/v1/chat/completions"
 
 async def send_to_llm(messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = MAX_RESPONSE_TOKENS) -> Dict[str, Any]:
-    """LLM запрос с ограничением concurrency"""
-    
     async with llm_semaphore:
         logger.info(f"🔄 LLM request (queue: {LLM_CONCURRENCY - llm_semaphore._value}/{LLM_CONCURRENCY})")
         
@@ -328,179 +587,61 @@ async def send_to_llm(messages: List[Dict[str, str]], temperature: float = 0.7, 
             logger.error(f"✗ Unexpected error: {e}")
             raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
-async def generate_summary(old_summary: str, messages: List[Dict]) -> str:
-    """Generate conversation summary"""
-    
-    recent_messages = "\n".join([
-        f"{m['role'].capitalize()}: {m['content'][:150]}"
-        for m in messages[-4:]
-    ])
-    
-    prompt = f"""Analyze this conversation and describe the current state.
+##################### 🆕 STEP 8: RESPONSE VALIDATION ####################
 
-Previous summary: {old_summary if old_summary else "New conversation"}
-
-Recent messages:
-{recent_messages}
-
-Create a brief summary (max 100 words) focusing ONLY on:
-1. Main goal/topic of conversation
-2. Current progress or stage
-3. Open questions or next steps
-4. Key decisions made
-
-DO NOT include:
-- User's name, language, or personal details
-- Full conversation history
-- Technical constants or system info
-
-Be task-focused and concise."""
-
-    llm_messages = [{"role": "user", "content": prompt}]
-    
-    try:
-        result = await send_to_llm(llm_messages, temperature=0.3, max_tokens=MAX_SUMMARY_TOKENS)
-        return result["content"].strip()
-    except Exception as e:
-        logger.error(f"✗ Summary generation failed: {e}")
-        return old_summary
-
-async def extract_user_facts(messages: List[Dict], current_profile: Dict[str, Any]) -> Dict[str, Any]:
+def validate_response(response: str, state: Dict[str, Any], previous_responses: List[str]) -> bool:
     """
-    🧠 АВТОМАТИЧЕСКАЯ ЭКСТРАКЦИЯ ФАКТОВ О ПОЛЬЗОВАТЕЛЕ
+    ✅ ПРОВЕРКА ОТВЕТА
     
-    Анализирует последние сообщения и извлекает:
-    - Имя, возраст, локацию
-    - Профессию, компанию, роль
-    - Технологии, интересы
-    - Проекты, цели
-    - Любые другие упомянутые факты
+    Проверяет:
+    - Релевантен ли ответ?
+    - Не повторяет ли предыдущие?
+    - Не ушёл ли в сторону?
+    
+    Если плохой — НЕ СОХРАНЯТЬ КАК ИСТИНУ
     """
     
-    # Берём последние 10 сообщений пользователя для анализа
-    user_messages = [m for m in messages if m.get("role") == "user"][-10:]
+    # 1. Проверка на повторение
+    response_lower = response.lower()
+    for prev in previous_responses[-3:]:  # last 3
+        prev_lower = prev.lower()
+        # Если более 60% совпадение - это повтор
+        overlap = len(set(response_lower.split()) & set(prev_lower.split()))
+        total = len(set(response_lower.split()))
+        if total > 0 and overlap / total > 0.6:
+            logger.warning("✗ Response rejected: too similar to previous")
+            return False
     
-    if not user_messages:
-        return current_profile
+    # 2. Проверка длины
+    if len(response) < 10:
+        logger.warning("✗ Response rejected: too short")
+        return False
     
-    conversation_text = "\n".join([
-        f"User: {m['content']}"
-        for m in user_messages
-    ])
+    # 3. Проверка на off-topic (опционально)
+    forbidden = state.get("forbidden_topics", [])
+    if forbidden:
+        for topic in forbidden:
+            if topic.lower() in response_lower:
+                logger.warning(f"✗ Response rejected: contains forbidden topic '{topic}'")
+                return False
     
-    # Показываем текущий профиль для контекста
-    current_facts = json.dumps(current_profile, indent=2, ensure_ascii=False)
-    
-    prompt = f"""Extract user facts from this conversation. Update or add new information.
+    return True
 
-CURRENT PROFILE:
-{current_facts}
-
-RECENT USER MESSAGES:
-{conversation_text}
-
-Extract and return ONLY NEW or UPDATED facts in JSON format:
-{{
-  "name": "actual name if mentioned",
-  "age": number or null,
-  "location": "city/country if mentioned",
-  "occupation": "job title",
-  "company": "company name",
-  "role": "professional role",
-  "tech_stack": ["technology1", "technology2"],
-  "interests": ["interest1", "interest2"],
-  "languages": ["language1", "language2"],
-  "projects": ["project1", "project2"],
-  "goals": ["goal1", "goal2"],
-  "preferences": {{"key": "value"}},
-  "other_facts": {{"custom_key": "custom_value"}}
-}}
-
-RULES:
-1. Return ONLY fields that have NEW or UPDATED information
-2. If user corrects their name (e.g., "My real name is Batyr"), update "name": "Batyr"
-3. Extract tech stack from mentions like "I use Python", "working with React"
-4. For lists, return only NEW items to add
-5. Use null for unknown fields
-6. Return valid JSON only, no explanations
-
-Example:
-User says: "My name is John, I'm a Python developer"
-Return: {{"name": "John", "tech_stack": ["Python"], "occupation": "developer"}}"""
-
-    llm_messages = [{"role": "user", "content": prompt}]
-    
-    try:
-        result = await send_to_llm(llm_messages, temperature=0.1, max_tokens=300)
-        response_text = result["content"].strip()
-        
-        # Извлекаем JSON из ответа
-        # Ищем JSON между фигурными скобками
-        import re
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        
-        if json_match:
-            extracted_facts = json.loads(json_match.group())
-            logger.info(f"✓ Extracted facts: {extracted_facts}")
-            return extracted_facts
-        else:
-            logger.warning("✗ No valid JSON found in profile extraction")
-            return {}
-            
-    except json.JSONDecodeError as e:
-        logger.error(f"✗ JSON decode error in profile extraction: {e}")
-        return {}
-    except Exception as e:
-        logger.error(f"✗ Profile extraction failed: {e}")
-        return {}
-
-##################### 🎯 CHAT PROCESSING ####################
-
-def build_system_prompt(profile: Dict[str, Any], summary: str, messages: List[Dict]) -> str:
-    """
-    🔑 Сборка контекста для LLM
-    Использует только последние CONTEXT_WINDOW сообщений
-    """
-    
-    parts = ["You are a helpful AI assistant."]
-    
-    # 🧠 A. USER PROFILE
-    profile_parts = []
-    if profile.get("name"):
-        profile_parts.append(f"User name: {profile['name']}")
-    if profile.get("age"):
-        profile_parts.append(f"Age: {profile['age']}")
-    if profile.get("location"):
-        profile_parts.append(f"Location: {profile['location']}")
-    if profile.get("occupation"):
-        profile_parts.append(f"Occupation: {profile['occupation']}")
-    if profile.get("company"):
-        profile_parts.append(f"Company: {profile['company']}")
-    if profile.get("tech_stack"):
-        profile_parts.append(f"Tech stack: {', '.join(profile['tech_stack'][:5])}")
-    if profile.get("interests"):
-        profile_parts.append(f"Interests: {', '.join(profile['interests'][:5])}")
-    
-    if profile_parts:
-        parts.append("\nUSER PROFILE:\n" + "\n".join(profile_parts))
-    
-    # 📜 B. CONVERSATION SUMMARY
-    if summary:
-        parts.append(f"\nCONVERSATION SUMMARY:\n{summary[:300]}")
-    
-    # 💬 C. RECENT MESSAGES (только последние CONTEXT_WINDOW)
-    if messages:
-        recent = messages[-CONTEXT_WINDOW:]
-        history = "\n".join([
-            f"{m['role'].capitalize()}: {m['content'][:200]}"
-            for m in recent
-        ])
-        parts.append(f"\nRECENT MESSAGES:\n{history}")
-    
-    return "\n".join(parts)
+##################### 🎯 MAIN CHAT PROCESSOR ####################
 
 async def process_chat_message(user_id: str, session_id: str, user_message: str) -> ChatResponse:
-    """Обработка сообщения с автоматическим обновлением профиля"""
+    """
+    🎯 ГЛАВНЫЙ ПРОЦЕССОР СООБЩЕНИЙ
+    
+    Шаги:
+    1. Получить Profile + State + Summary + History
+    2. Извлечь Intent из сообщения
+    3. Обновить Dialog State
+    4. Собрать умный промпт
+    5. Получить ответ от LLM
+    6. Проверить ответ
+    7. Сохранить или отклонить
+    """
     
     # Rate limit
     if not check_rate_limit(user_id, session_id):
@@ -509,33 +650,57 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
             detail=f"Rate limit: max {RATE_LIMIT_REQUESTS} req per {RATE_LIMIT_WINDOW}s"
         )
     
-    # Получаем сессию
+    # Get session
     session = get_session(user_id, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
     messages = session.get("messages", [])
-    message_count = len(messages)
-    last_profile_check = session.get("last_profile_check", 0)
     
-    # Получаем профиль и summary
+    # STEP 1: Load memory tiers
     profile = get_user_profile(user_id)
+    state = get_dialog_state(user_id, session_id)
     summary = get_summary(user_id, session_id)
     
-    # 🎯 Собираем system prompt (с последними CONTEXT_WINDOW сообщениями)
-    system_content = build_system_prompt(profile, summary, messages)
+    # STEP 2: Extract intent
+    logger.info("🎯 Extracting intent...")
+    new_state = await extract_intent(user_message, state, profile)
     
-    # LLM запрос
+    # STEP 3: Update dialog state
+    update_dialog_state(user_id, session_id, new_state)
+    
+    # STEP 4: Build smart prompt
+    logger.info("🧠 Building smart prompt...")
+    system_content = build_system_prompt(profile, new_state, summary, messages)
+    
+    # Get rules for response metadata
+    rules = build_response_rules(profile, new_state)
+    
+    # STEP 5: Get LLM response
     llm_messages = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": user_message}
     ]
     
-    # Получаем ответ
     result = await send_to_llm(llm_messages)
     ai_response = result["content"]
     
-    # Сохраняем сообщения (ВСЕ, до MAX_HISTORY_LENGTH)
+    # STEP 6: Validate response
+    previous_responses = [m["content"] for m in messages if m.get("role") == "assistant"]
+    
+    if not validate_response(ai_response, new_state, previous_responses):
+        # Retry once with stronger rules
+        logger.warning("⚠️  First response rejected, retrying with stricter rules...")
+        rules.append("CRITICAL: This is a retry. Previous response was rejected for repetition or off-topic content.")
+        rules.append("Provide a COMPLETELY DIFFERENT answer with NEW information.")
+        
+        system_content = build_system_prompt(profile, new_state, summary, messages)
+        llm_messages[0]["content"] = system_content
+        
+        result = await send_to_llm(llm_messages, temperature=0.9)  # higher temp for variety
+        ai_response = result["content"]
+    
+    # STEP 7: Save messages
     timestamp = datetime.utcnow().isoformat()
     messages.append({
         "role": "user",
@@ -548,33 +713,12 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         "timestamp": timestamp
     })
     
-    # 🧠 ПРОВЕРКА ПРОФИЛЯ - каждые PROFILE_UPDATE_THRESHOLD сообщений
-    profile_updated = False
-    new_message_count = len(messages)
+    update_session(user_id, session_id, messages)
     
-    if new_message_count - last_profile_check >= PROFILE_UPDATE_THRESHOLD:
-        logger.info(f"🧠 Checking profile for {user_id} (messages: {new_message_count})")
-        
-        # Извлекаем новые факты
-        extracted_facts = await extract_user_facts(messages, profile)
-        
-        if extracted_facts:
-            # Мерджим с существующим профилем
-            updated_profile = merge_profile_facts(profile, extracted_facts)
-            update_user_profile(user_id, updated_profile)
-            profile_updated = True
-            logger.info(f"✓ Profile updated with new facts: {list(extracted_facts.keys())}")
-        
-        # Обновляем last_profile_check
-        update_session(user_id, session_id, messages, last_profile_check=new_message_count)
-    else:
-        # Обычное обновление сессии
-        update_session(user_id, session_id, messages)
-    
-    # Обновляем summary если нужно
+    # Update summary if needed
     new_summary = None
     if len(messages) >= SUMMARY_THRESHOLD:
-        logger.info(f"📝 Generating summary for {user_id}:{session_id}")
+        logger.info("📝 Updating summary...")
         new_summary = await generate_summary(summary, messages)
         update_summary(user_id, session_id, new_summary)
     
@@ -583,17 +727,18 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         session_id=session_id,
         response=ai_response,
         timestamp=timestamp,
+        intent=new_state,
         summary=new_summary,
-        profile_updated=profile_updated,
-        tokens_used=result.get("tokens_used")
+        tokens_used=result.get("tokens_used"),
+        rules_applied=rules[:5]  # top 5 rules for debugging
     )
 
 ##################### FASTAPI APP ####################
 
 app = FastAPI(
-    title="AI Chat Server - Auto Profile Memory",
-    description="3-tier memory with automatic profile extraction",
-    version="3.0.0"
+    title="Smart Chat Server v4.0",
+    description="Intent-Driven Architecture with Dialog State",
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -606,8 +751,9 @@ app.add_middleware(
 
 chat_router = APIRouter(prefix="/chat", tags=["chat"])
 session_router = APIRouter(prefix="/session", tags=["session"])
-summary_router = APIRouter(prefix="/summary", tags=["summary"])
 profile_router = APIRouter(prefix="/profile", tags=["profile"])
+summary_router = APIRouter(prefix="/summary", tags=["summary"])
+state_router = APIRouter(prefix="/state", tags=["dialog_state"])
 
 ##################### HEALTH CHECK ####################
 
@@ -632,14 +778,18 @@ async def health_check():
         "status": "ok" if redis_status == "ok" and llm_status == "ok" else "degraded",
         "redis": redis_status,
         "llm": llm_status,
-        "memory_architecture": {
-            "profile": "auto-extracted user facts",
-            "summary": "conversation state",
-            "history": f"last {MAX_HISTORY_LENGTH} messages stored",
-            "context": f"last {CONTEXT_WINDOW} messages sent to LLM"
+        "architecture": {
+            "tier_1": "User Profile (passport - stable facts)",
+            "tier_2": "Dialog State (intent - current goal)",
+            "tier_3": "Summary (where we are now)",
+            "tier_4": "History (raw messages for analysis)"
         },
-        "config": {
-            "profile_check_interval": f"every {PROFILE_UPDATE_THRESHOLD} messages"
+        "features": {
+            "intent_extraction": "automatic",
+            "response_validation": "enabled",
+            "dynamic_rules": "enabled",
+            "modes": RESPONSE_MODES,
+            "levels": USER_LEVELS
         },
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -648,7 +798,15 @@ async def health_check():
 
 @chat_router.post("/", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """Send message with auto profile extraction"""
+    """
+    🎯 Main chat endpoint with intent-driven processing
+    
+    Features:
+    - Automatic intent extraction
+    - Dynamic response rules
+    - Response validation
+    - Smart context assembly
+    """
     try:
         return await process_chat_message(req.user_id, req.session_id, req.message)
     except HTTPException:
@@ -671,30 +829,35 @@ def create_new_session(req: SessionCreate):
 
 @session_router.get("/{user_id}/{session_id}")
 def get_session_info(user_id: str, session_id: str):
-    """Get session info with full history"""
+    """Get full session info with all memory tiers"""
     session = get_session(user_id, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return session
+    
+    # Include all memory tiers
+    profile = get_user_profile(user_id)
+    state = get_dialog_state(user_id, session_id)
+    summary = get_summary(user_id, session_id)
+    
+    return {
+        **session,
+        "profile": profile,
+        "dialog_state": state,
+        "summary": summary
+    }
 
 @session_router.delete("/{user_id}/{session_id}")
 def remove_session(user_id: str, session_id: str):
-    """Delete session"""
+    """Delete session and all associated data"""
     if not delete_session(user_id, session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     return {"message": "Session deleted", "user_id": user_id, "session_id": session_id}
-
-@session_router.get("/{user_id}")
-def get_user_sessions(user_id: str, limit: int = 100):
-    """List all sessions for user"""
-    sessions = list_sessions(user_id, limit)
-    return {"user_id": user_id, "sessions": sessions, "count": len(sessions)}
 
 ##################### PROFILE ENDPOINTS ####################
 
 @profile_router.get("/{user_id}")
 def read_user_profile(user_id: str):
-    """Get user profile (auto-extracted)"""
+    """Get user profile (passport)"""
     profile = get_user_profile(user_id)
     return {
         "user_id": user_id,
@@ -703,7 +866,7 @@ def read_user_profile(user_id: str):
 
 @profile_router.post("/update")
 def edit_user_profile(req: ProfileUpdate):
-    """Manually update user profile"""
+    """Update user profile"""
     current = get_user_profile(req.user_id)
     merged = merge_profile_facts(current, req.profile_data)
     update_user_profile(req.user_id, merged)
@@ -713,35 +876,55 @@ def edit_user_profile(req: ProfileUpdate):
         "updated_at": datetime.utcnow().isoformat()
     }
 
-@profile_router.post("/{user_id}/extract")
-async def force_profile_extraction(user_id: str, session_id: str):
-    """Force profile extraction from current session"""
-    session = get_session(user_id, session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    messages = session.get("messages", [])
-    if not messages:
-        raise HTTPException(status_code=400, detail="No messages to analyze")
-    
-    current_profile = get_user_profile(user_id)
-    extracted_facts = await extract_user_facts(messages, current_profile)
-    
-    if extracted_facts:
-        updated_profile = merge_profile_facts(current_profile, extracted_facts)
-        update_user_profile(user_id, updated_profile)
-        
-        return {
-            "user_id": user_id,
-            "extracted_facts": extracted_facts,
-            "updated_profile": updated_profile,
-            "updated_at": datetime.utcnow().isoformat()
-        }
-    
+@profile_router.delete("/{user_id}")
+def delete_user_profile(user_id: str):
+    """Delete user profile"""
+    key = f"{USER_PROFILE_PREFIX}{user_id}"
+    deleted = r.delete(key)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"message": "Profile deleted", "user_id": user_id}
+
+##################### DIALOG STATE ENDPOINTS ####################
+
+@state_router.get("/{user_id}/{session_id}")
+def read_dialog_state(user_id: str, session_id: str):
+    """Get current dialog state (intent)"""
+    state = get_dialog_state(user_id, session_id)
     return {
         "user_id": user_id,
-        "message": "No new facts extracted",
-        "current_profile": current_profile
+        "session_id": session_id,
+        "dialog_state": state
+    }
+
+@state_router.post("/{user_id}/{session_id}/update")
+def manual_state_update(user_id: str, session_id: str, state: Dict[str, Any]):
+    """Manually update dialog state"""
+    update_dialog_state(user_id, session_id, state)
+    return {
+        "user_id": user_id,
+        "session_id": session_id,
+        "dialog_state": state,
+        "updated_at": datetime.utcnow().isoformat()
+    }
+
+@state_router.post("/{user_id}/{session_id}/reset")
+def reset_dialog_state(user_id: str, session_id: str):
+    """Reset dialog state to default"""
+    default_state = {
+        "current_goal": None,
+        "mode": "learn",
+        "detail_level": "normal",
+        "understood_concepts": [],
+        "forbidden_topics": [],
+        "context_type": None
+    }
+    update_dialog_state(user_id, session_id, default_state)
+    return {
+        "message": "Dialog state reset",
+        "user_id": user_id,
+        "session_id": session_id,
+        "dialog_state": default_state
     }
 
 ##################### SUMMARY ENDPOINTS ####################
@@ -756,37 +939,16 @@ def read_summary(user_id: str, session_id: str):
         "summary": summary if summary else "No summary available"
     }
 
-@summary_router.post("/{user_id}/{session_id}")
-def edit_summary(user_id: str, session_id: str, req: SummaryUpdate):
-    """Update summary manually"""
-    if not get_session(user_id, session_id):
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    update_summary(user_id, session_id, req.new_summary)
-    return {
-        "user_id": user_id,
-        "session_id": session_id,
-        "summary": req.new_summary,
-        "updated_at": datetime.utcnow().isoformat()
-    }
-
-@summary_router.delete("/{user_id}/{session_id}")
-def remove_summary(user_id: str, session_id: str):
-    """Delete summary"""
-    if not delete_summary(user_id, session_id):
-        raise HTTPException(status_code=404, detail="Summary not found")
-    return {"message": "Summary deleted", "user_id": user_id, "session_id": session_id}
-
 @summary_router.post("/{user_id}/{session_id}/regenerate")
 async def regenerate_summary(user_id: str, session_id: str):
-    """Regenerate summary"""
+    """Regenerate summary from current messages"""
     session = get_session(user_id, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
     messages = session.get("messages", [])
     if not messages:
-        raise HTTPException(status_code=400, detail="No messages")
+        raise HTTPException(status_code=400, detail="No messages to summarize")
     
     old_summary = get_summary(user_id, session_id)
     new_summary = await generate_summary(old_summary, messages)
@@ -799,11 +961,20 @@ async def regenerate_summary(user_id: str, session_id: str):
         "updated_at": datetime.utcnow().isoformat()
     }
 
-##################### STATS ####################
+@summary_router.delete("/{user_id}/{session_id}")
+def remove_summary(user_id: str, session_id: str):
+    """Delete summary"""
+    key = f"{SUMMARY_PREFIX}{user_id}:{session_id}"
+    deleted = r.delete(key)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Summary not found")
+    return {"message": "Summary deleted", "user_id": user_id, "session_id": session_id}
+
+##################### ANALYTICS & DEBUG ####################
 
 @app.get("/stats")
 def get_stats():
-    """Server statistics"""
+    """Server statistics and configuration"""
     return {
         "active_rate_limits": len(rate_limit_tracker),
         "llm_queue": LLM_CONCURRENCY - llm_semaphore._value,
@@ -814,23 +985,148 @@ def get_stats():
             "concurrency": LLM_CONCURRENCY,
             "rate_limit": f"{RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s",
             "profile_update_threshold": PROFILE_UPDATE_THRESHOLD
+        },
+        "architecture": {
+            "memory_tiers": 4,
+            "intent_driven": True,
+            "response_validation": True,
+            "dynamic_rules": True
+        },
+        "supported": {
+            "modes": RESPONSE_MODES,
+            "levels": USER_LEVELS
         }
+    }
+
+@app.get("/debug/{user_id}/{session_id}")
+async def debug_session(user_id: str, session_id: str):
+    """
+    🔍 Debug endpoint - shows complete memory state
+    
+    Useful for understanding how the system works
+    """
+    session = get_session(user_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    profile = get_user_profile(user_id)
+    state = get_dialog_state(user_id, session_id)
+    summary = get_summary(user_id, session_id)
+    rules = build_response_rules(profile, state)
+    
+    messages = session.get("messages", [])
+    recent_messages = messages[-CONTEXT_WINDOW:] if messages else []
+    
+    return {
+        "user_id": user_id,
+        "session_id": session_id,
+        "memory_tiers": {
+            "tier_1_profile": profile,
+            "tier_2_dialog_state": state,
+            "tier_3_summary": summary,
+            "tier_4_history_count": len(messages)
+        },
+        "context_sent_to_llm": {
+            "profile_fields": [k for k, v in profile.items() if v],
+            "dialog_state": state,
+            "summary_length": len(summary) if summary else 0,
+            "recent_messages_count": len(recent_messages),
+            "recent_messages": recent_messages
+        },
+        "active_rules": rules,
+        "system_prompt_preview": build_system_prompt(profile, state, summary, messages)[:500] + "..."
+    }
+
+##################### TESTING ENDPOINTS ####################
+
+@app.post("/test/scenario")
+async def test_scenario(user_id: str, scenario: str):
+    """
+    🧪 Test different user scenarios
+    
+    Scenarios:
+    - beginner_learning
+    - senior_debugging
+    - quick_answers
+    - detailed_explanation
+    """
+    
+    # Create test session
+    session_id = create_session(user_id, {"test_scenario": scenario})
+    
+    # Set profile based on scenario
+    if scenario == "beginner_learning":
+        profile = {
+            "name": "TestUser",
+            "level": "beginner",
+            "role": "student",
+            "tech_stack": [],
+            "language": "en"
+        }
+        test_message = "How do I create a function in Python?"
+        
+    elif scenario == "senior_debugging":
+        profile = {
+            "name": "TestUser",
+            "level": "senior",
+            "role": "engineer",
+            "tech_stack": ["Python", "FastAPI", "Redis"],
+            "language": "en"
+        }
+        test_message = "My Redis connection keeps timing out in production"
+        
+    elif scenario == "quick_answers":
+        profile = {
+            "name": "TestUser",
+            "level": "middle",
+            "role": "developer",
+            "tech_stack": ["JavaScript"],
+            "language": "en"
+        }
+        test_message = "Quick: what's the difference between let and const?"
+        
+    elif scenario == "detailed_explanation":
+        profile = {
+            "name": "TestUser",
+            "level": "junior",
+            "role": "student",
+            "tech_stack": ["React"],
+            "language": "en"
+        }
+        test_message = "Explain React hooks in detail with examples"
+        
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown scenario: {scenario}")
+    
+    # Update profile
+    update_user_profile(user_id, profile)
+    
+    # Process message
+    response = await process_chat_message(user_id, session_id, test_message)
+    
+    return {
+        "scenario": scenario,
+        "session_id": session_id,
+        "test_message": test_message,
+        "profile_used": profile,
+        "response": response
     }
 
 ##################### INCLUDE ROUTERS ####################
 
 app.include_router(chat_router)
 app.include_router(session_router)
-app.include_router(summary_router)
 app.include_router(profile_router)
+app.include_router(state_router)
+app.include_router(summary_router)
 
 ##################### STARTUP/SHUTDOWN ####################
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("=" * 60)
-    logger.info("🚀 AI CHAT SERVER - AUTO PROFILE MEMORY v3")
-    logger.info("=" * 60)
+    logger.info("=" * 80)
+    logger.info("🚀 SMART CHAT SERVER v4.0 - INTENT-DRIVEN ARCHITECTURE")
+    logger.info("=" * 80)
     
     try:
         r.ping()
@@ -838,24 +1134,43 @@ async def startup_event():
     except Exception as e:
         logger.error(f"✗ Redis: FAILED - {e}")
     
-    logger.info("📚 Memory Architecture:")
-    logger.info("   🧠 Profile: auto-extracted user facts (one per user)")
-    logger.info("   📜 Summary: conversation state")
-    logger.info(f"   💾 History: last {MAX_HISTORY_LENGTH} messages stored")
-    logger.info(f"   💬 Context: last {CONTEXT_WINDOW} messages sent to LLM")
     logger.info("")
-    logger.info(f"⚙️  Config:")
+    logger.info("📚 4-TIER MEMORY ARCHITECTURE:")
+    logger.info("   1️⃣  USER PROFILE    → Passport (stable facts)")
+    logger.info("   2️⃣  DIALOG STATE    → Intent (current goal, mode)")
+    logger.info("   3️⃣  SUMMARY         → Where we are now")
+    logger.info("   4️⃣  HISTORY         → Raw messages (analysis only)")
+    logger.info("")
+    logger.info("🎯 KEY FEATURES:")
+    logger.info("   ✓ Automatic intent extraction from each message")
+    logger.info("   ✓ Dynamic response rules based on context")
+    logger.info("   ✓ Response validation (anti-repetition)")
+    logger.info("   ✓ Smart prompt assembly (only relevant context)")
+    logger.info("")
+    logger.info("⚙️  CONFIGURATION:")
     logger.info(f"   • Max tokens: {MAX_RESPONSE_TOKENS}")
-    logger.info(f"   • Max history: {MAX_HISTORY_LENGTH} (stored)")
-    logger.info(f"   • Context window: {CONTEXT_WINDOW} (sent to LLM)")
-    logger.info(f"   • Profile check: every {PROFILE_UPDATE_THRESHOLD} messages")
-    logger.info(f"   • Concurrency: {LLM_CONCURRENCY}")
-    logger.info(f"   • Rate limit: {RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW}s")
-    logger.info("=" * 60)
+    logger.info(f"   • History stored: {MAX_HISTORY_LENGTH} messages")
+    logger.info(f"   • Context sent to LLM: {CONTEXT_WINDOW} messages")
+    logger.info(f"   • Concurrency: {LLM_CONCURRENCY} parallel requests")
+    logger.info(f"   • Rate limit: {RATE_LIMIT_REQUESTS} req/{RATE_LIMIT_WINDOW}s")
+    logger.info("")
+    logger.info("🔧 SUPPORTED MODES:")
+    logger.info(f"   • Response modes: {', '.join(RESPONSE_MODES)}")
+    logger.info(f"   • User levels: {', '.join(USER_LEVELS)}")
+    logger.info("")
+    logger.info("🧪 TEST ENDPOINTS:")
+    logger.info("   • POST /test/scenario - Test different user scenarios")
+    logger.info("   • GET /debug/{user_id}/{session_id} - Full memory inspection")
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("LLM = ИСПОЛНИТЕЛЬ | BACKEND = МОЗГ")
+    logger.info("=" * 80)
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("👋 Shutting down...")
+    logger.info("👋 Shutting down Smart Chat Server v4.0...")
+
+##################### MAIN ####################
 
 if __name__ == "__main__":
     import uvicorn
