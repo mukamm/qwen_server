@@ -143,7 +143,8 @@ def get_user_profile(user_id: str) -> Dict[str, Any]:
     data = r.get(key)
     
     if not data:
-        return {
+        # 🆕 АВТОСОЗДАНИЕ ДЕФОЛТНОГО ПРОФИЛЯ
+        default_profile = {
             "name": None,
             "age": None,
             "role": None,  # student/engineer/designer/etc
@@ -153,6 +154,10 @@ def get_user_profile(user_id: str) -> Dict[str, Any]:
             "interests": [],
             "learning_goals": []
         }
+        # Сохраняем дефолтный профиль в Redis
+        update_user_profile(user_id, default_profile)
+        logger.info(f"✓ Created default profile for user: {user_id}")
+        return default_profile
     
     return json.loads(data)
 
@@ -202,7 +207,8 @@ def get_dialog_state(user_id: str, session_id: str) -> Dict[str, Any]:
     data = r.get(key)
     
     if not data:
-        return {
+        # 🆕 АВТОСОЗДАНИЕ ДЕФОЛТНОГО STATE
+        default_state = {
             "current_goal": None,  # "learn React", "debug error", "design system"
             "mode": "learn",  # learn/debug/inspect/design/quick
             "detail_level": "normal",  # brief/normal/detailed
@@ -211,6 +217,10 @@ def get_dialog_state(user_id: str, session_id: str) -> Dict[str, Any]:
             "context_type": None,  # code/theory/architecture/practice
             "last_updated": None
         }
+        # Сохраняем дефолтный state в Redis
+        update_dialog_state(user_id, session_id, default_state)
+        logger.info(f"✓ Created default dialog state: {user_id}:{session_id}")
+        return default_state
     
     return json.loads(data)
 
@@ -353,7 +363,95 @@ Focus on CURRENT STATE, not past."""
         logger.error(f"✗ Summary generation failed: {e}")
         return old_summary
 
-##################### 🆕 STEP 3: INTENT EXTRACTION ####################
+##################### 🆕 AUTO PROFILE EXTRACTION ####################
+
+async def extract_user_facts(messages: List[Dict], current_profile: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    🧠 АВТОМАТИЧЕСКАЯ ЭКСТРАКЦИЯ ФАКТОВ О ПОЛЬЗОВАТЕЛЕ
+    
+    Анализирует последние сообщения и извлекает:
+    - Имя, возраст, локацию
+    - Профессию, роль, уровень
+    - Технологии, интересы
+    - Любые другие упомянутые факты
+    """
+    
+    # Берём последние 10 сообщений пользователя для анализа
+    user_messages = [m for m in messages if m.get("role") == "user"][-10:]
+    
+    if not user_messages:
+        return {}
+    
+    conversation_text = "\n".join([
+        f"User: {m['content']}"
+        for m in user_messages
+    ])
+    
+    # Показываем текущий профиль для контекста
+    current_facts = json.dumps(current_profile, indent=2, ensure_ascii=False)
+    
+    prompt = f"""Extract user facts from this conversation. Update or add new information.
+
+CURRENT PROFILE:
+{current_facts}
+
+RECENT USER MESSAGES:
+{conversation_text}
+
+Extract and return ONLY NEW or UPDATED facts in JSON format:
+{{
+  "name": "actual name if mentioned",
+  "age": number or null,
+  "role": "job title like student/engineer/developer/designer",
+  "level": "beginner/junior/middle/senior/expert",
+  "tech_stack": ["technology1", "technology2"],
+  "interests": ["interest1", "interest2"],
+  "language": "en/ru/etc",
+  "learning_goals": ["goal1", "goal2"]
+}}
+
+EXTRACTION RULES:
+1. Return ONLY fields that have NEW or UPDATED information
+2. If user says "My name is Batyr" → return {{"name": "Batyr"}}
+3. If user says "I know Python" → return {{"tech_stack": ["Python"]}}
+4. If user says "I am a senior developer" → return {{"level": "senior", "role": "developer"}}
+5. If user says "I want to learn FastAPI" → return {{"learning_goals": ["learn FastAPI"], "tech_stack": ["FastAPI"]}}
+6. For lists, return only NEW items to add
+7. Use null for unknown fields
+8. Detect level from phrases like:
+   - "I'm new to", "beginner" → "beginner"
+   - "I know basics" → "junior"
+   - "I have experience" → "middle"
+   - "I'm senior", "expert" → "senior"
+9. Return ONLY valid JSON, no explanations
+
+Example:
+User: "Hi! My name is Batyr and I want to learn FastAPI. I already know Python and Django"
+Return: {{"name": "Batyr", "tech_stack": ["Python", "Django", "FastAPI"], "learning_goals": ["learn FastAPI"]}}"""
+
+    llm_messages = [{"role": "user", "content": prompt}]
+    
+    try:
+        result = await send_to_llm(llm_messages, temperature=0.1, max_tokens=300)
+        response_text = result["content"].strip()
+        
+        # Извлекаем JSON из ответа
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        
+        if json_match:
+            extracted_facts = json.loads(json_match.group())
+            logger.info(f"✓ Extracted facts: {extracted_facts}")
+            return extracted_facts
+        else:
+            logger.warning("✗ No valid JSON found in profile extraction")
+            return {}
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"✗ JSON decode error in profile extraction: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"✗ Profile extraction failed: {e}")
+        return {}
 
 async def extract_intent(user_message: str, current_state: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -637,10 +735,11 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
     1. Получить Profile + State + Summary + History
     2. Извлечь Intent из сообщения
     3. Обновить Dialog State
-    4. Собрать умный промпт
-    5. Получить ответ от LLM
-    6. Проверить ответ
-    7. Сохранить или отклонить
+    4. 🆕 АВТОМАТИЧЕСКИ ОБНОВИТЬ ПРОФИЛЬ (каждые N сообщений)
+    5. Собрать умный промпт
+    6. Получить ответ от LLM
+    7. Проверить ответ
+    8. Сохранить или отклонить
     """
     
     # Rate limit
@@ -656,6 +755,8 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         raise HTTPException(status_code=404, detail="Session not found")
     
     messages = session.get("messages", [])
+    message_count = len(messages)
+    last_profile_check = session.get("last_profile_check", 0)
     
     # STEP 1: Load memory tiers
     profile = get_user_profile(user_id)
@@ -669,14 +770,43 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
     # STEP 3: Update dialog state
     update_dialog_state(user_id, session_id, new_state)
     
-    # STEP 4: Build smart prompt
+    # 🆕 STEP 4: AUTO-UPDATE PROFILE (каждые PROFILE_UPDATE_THRESHOLD сообщений)
+    profile_updated = False
+    
+    # Всегда проверяем первые 3 сообщения для быстрого обучения
+    should_check = (
+        message_count < 6 or  # Первые 3 обмена (6 сообщений)
+        message_count - last_profile_check >= PROFILE_UPDATE_THRESHOLD
+    )
+    
+    if should_check:
+        logger.info(f"🧠 Auto-extracting profile facts (message #{message_count})...")
+        
+        # Добавляем текущее сообщение к истории для анализа
+        temp_messages = messages + [{"role": "user", "content": user_message}]
+        
+        # Извлекаем факты
+        extracted_facts = await extract_user_facts(temp_messages, profile)
+        
+        if extracted_facts:
+            # Мерджим с существующим профилем
+            updated_profile = merge_profile_facts(profile, extracted_facts)
+            update_user_profile(user_id, updated_profile)
+            profile = updated_profile  # Используем обновлённый профиль сразу
+            profile_updated = True
+            logger.info(f"✓ Profile auto-updated: {list(extracted_facts.keys())}")
+        
+        # Обновляем счётчик проверки
+        last_profile_check = message_count
+    
+    # STEP 5: Build smart prompt
     logger.info("🧠 Building smart prompt...")
     system_content = build_system_prompt(profile, new_state, summary, messages)
     
     # Get rules for response metadata
     rules = build_response_rules(profile, new_state)
     
-    # STEP 5: Get LLM response
+    # STEP 6: Get LLM response
     llm_messages = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": user_message}
@@ -685,7 +815,7 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
     result = await send_to_llm(llm_messages)
     ai_response = result["content"]
     
-    # STEP 6: Validate response
+    # STEP 7: Validate response
     previous_responses = [m["content"] for m in messages if m.get("role") == "assistant"]
     
     if not validate_response(ai_response, new_state, previous_responses):
@@ -700,7 +830,7 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         result = await send_to_llm(llm_messages, temperature=0.9)  # higher temp for variety
         ai_response = result["content"]
     
-    # STEP 7: Save messages
+    # STEP 8: Save messages
     timestamp = datetime.utcnow().isoformat()
     messages.append({
         "role": "user",
@@ -713,7 +843,8 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         "timestamp": timestamp
     })
     
-    update_session(user_id, session_id, messages)
+    # Сохраняем с обновлённым last_profile_check
+    update_session(user_id, session_id, messages, last_profile_check=last_profile_check)
     
     # Update summary if needed
     new_summary = None
@@ -729,6 +860,7 @@ async def process_chat_message(user_id: str, session_id: str, user_message: str)
         timestamp=timestamp,
         intent=new_state,
         summary=new_summary,
+        profile_updated=profile_updated,
         tokens_used=result.get("tokens_used"),
         rules_applied=rules[:5]  # top 5 rules for debugging
     )
